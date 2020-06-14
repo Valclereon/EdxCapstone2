@@ -1,0 +1,2743 @@
+---
+title: "EDX - Capstone ML Parking Sales (Independent Module)"
+author: "John Horbino"
+date: "13/06/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+
+## 00_1 Download packages and load libraries ----
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(ggplot2)) install.packages("ggplot2",repos = "http://cran.us.r-project.org")
+if(!require(zoo)) install.packages("zoo",repos = "http://cran.us.r-project.org")
+if(!require(broom)) install.packages("broom",repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate",repos = "http://cran.us.r-project.org")
+
+
+
+## 00_2 Download data from github ----
+githubURL <- "https://github.com/jhorbino93/EdxCapstone2/raw/master/Edx_Capstone2_Initialisation_WS.RData"
+
+file_name <- "Edx_Capstone2_Initialisation_WS.RData"
+
+working_directory <- getwd()
+download.file(githubURL,file_name)
+load(file.path(working_directory, file_name))
+
+## 00_3 Prepare parameters ----
+
+rolling_period_long <- 7*52
+# date_pre_covid <- as.Date("2020-01-31")
+date_avg_start <- as.Date("2017-01-01")
+date_ts_start  <- as.Date("2017-01-01")
+# date_ts_end <- as.Date("2020-02-29")
+date_ts_end <- as.Date("2020-05-31")
+date_edm_start <- as.Date("2018-11-01")
+
+date_pre_covid_start <- as.Date("2001-01-01")
+date_pre_covid_end <- as.Date("2020-03-12")
+date_transition_covid_start <- as.Date("2020-03-13")
+date_transition_covid_end <- as.Date("2020-03-25")
+date_recovery_covid_start <- as.Date("2020-03-26")
+date_recovery_covid_end <- as.Date("9999-12-31")
+
+date_centre_start <- date_avg_start + floor(rolling_period_long/2)
+date_centre_end <- date_ts_end - floor(rolling_period_long/2)
+date_all_components_start <- "2018-09-26"
+# date_all_components_end <- date_centre_end
+
+EDM_lag_days <- seq(1,3,1)
+min_pvalue <- 0.1
+min_abs_cor <- 0.3    
+
+sample_ReportLevel4Key <- 247
+sample_StayLengthKey <- 10
+sample_DimAmountTypeKey <- 103
+
+## 01_1 Prepare initial data frames ----
+
+  ## Transform to tibble and rename some columns
+  edx_eda <- 
+    as_tibble(edx_eda) %>%
+    rename(Amount = raw_amount) %>%
+    left_join(
+      select(DimStayLength,StayLengthKey,StayLength_l1_Rank)
+      ,by = "StayLengthKey"
+    ) %>%
+    mutate(
+      DatePeriod = ifelse(
+                    Date <= as.Date("2020-03-12"),"Pre-COVID"
+                      ,ifelse(Date >= as.Date("2020-03-13") & Date <= as.Date("2020-03-26"),"Transition-COVID"
+                        ,"Recovery-COVID"
+                      )
+                    )
+    ) %>% group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DatePeriod) %>% arrange(Date) %>%
+    mutate(
+      RollingPeriod = ifelse(as.integer(Date - Date[1]) + 1 > rolling_period_long, rolling_period_long, as.integer(Date - Date[1]) + 1)
+    ) %>% ungroup()
+
+  tmpPriceFill <- 
+    edx_eda %>%
+    dplyr::filter(
+      DimAmountTypeKey == 100
+    ) %>%
+    mutate(
+      Amount = ifelse(abs(Amount) %in% c(0,Inf),NA,Amount)
+    ) %>% group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>% arrange(Date) %>%
+    fill(Amount) %>% ungroup() %>%
+    select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,Amount) %>%
+    rename(NewAmount = Amount)
+  
+  edx_eda <-
+    edx_eda %>%
+    left_join(tmpPriceFill,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")) %>%
+    mutate(
+      Amount = coalesce(ifelse(DimAmountTypeKey == 100,NewAmount,Amount),0)
+    ) %>% select(-NewAmount)
+  
+  rm(tmpPriceFill)
+
+  ## This data frame will be used to calculate a long term trend
+  dfTrend <- 
+    edx_eda %>%
+    dplyr::filter(
+      Date >= date_avg_start
+      & Date <= date_ts_end    
+    ) %>%
+    select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,Amount,DatePeriod,RollingPeriod)
+
+## 01_2 Prepare functions ----
+
+roll_mean_cust <- function(x,period){
+  rollapply(x,period,function(y) mean(y)
+            ,fill = NA, by.column = F, align = "center", partial = T)
+}
+  
+RMSE <- function(target, prediction){
+  sqrt(mean((target - prediction)^2))
+}  
+  
+
+write.excel <- function(x,row.names=FALSE,col.names=TRUE,...) {
+  write.table(x,"clipboard-16394",sep="\t",row.names=row.names,col.names=col.names,...)
+}
+
+funApplyDecompositionHierarchy_l2 <- function(x){
+  factor(
+    if (x %in% c("Amount")){
+      "Actual Results"
+    } else if  (x %in% c("Predict_TrendLong")){
+      "Long Term Trend"
+    } else if (x %in% c("Predict_SeasonalMonth","Predict_SeasonalDOW","Predict_SeasonalSchoolHoliday","Predict_SeasonalInfluentialDate")) {
+      "Seasonality"
+    } else if (x %in% c("Predict_EDMMajorAvg","Predict_EDMMajorMonth","Predict_EDMMajorDOW","Predict_EDMMajorMonthRgr","Predict_EDMMajorDOWRgr")) {
+      "EDM Initial Impact"
+    } else if (x %in% c("Predict_EDMMajorLaggedAvg","Predict_EDMMajorLaggedDays","Predict_EDMMajorLaggedDaysDOW")){
+      "EDM Lagged Impact"
+    } else if (x %in% c("Residual")){
+      "Residual"
+    } else {
+      "Other"
+    }
+    ,levels = c("Actual Results","Long Term Trend","Seasonality","EDM Initial Impact","EDM Lagged Impact","Residual","Other")
+    ,ordered = T
+  )
+}
+
+## 10 Calculate long term trends ----
+
+  ## data.table is used here for speed as keys can be used for indexing
+  ## dplyr can still be used but is generally slower, especially for larger data frames
+
+  setDT(dfTrend)
+  setkey(dfTrend,Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DatePeriod)
+  dfTrend[,Predict_TrendLong:= as.numeric(roll_mean_cust(Amount,RollingPeriod)), by = c("StayLengthKey","ReportLevel4Key","DimAmountTypeKey","DatePeriod")]
+  
+  ## Convert back to tibble
+  dfTrend <- as_tibble(dfTrend)
+  
+
+## 11 Prepare primary data frame ----
+## This will be partitioned for training and validation
+  
+  dfMain <-
+    edx_eda %>%
+    dplyr::filter(
+      Date >= date_avg_start
+      & Date <= date_ts_end    
+      # & FlagWithinCentre == 1
+    ) %>%
+    left_join(
+      select(dfTrend,Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,Predict_TrendLong)
+      ,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")
+    ) %>%
+    mutate(
+      Residual_TrendLong = Amount - Predict_TrendLong
+    )
+
+  ## Generate daily relative price change with respect to long term price change
+  ## This value will be used later for regression training
+  tmpATV <-
+    dfMain %>%
+    dplyr::filter(
+      DimAmountTypeKey == 100
+    ) %>%
+    group_by(ReportLevel4Key,StayLengthKey) %>% arrange(Date) %>%
+    mutate(
+      AmountPrior = lag(Amount)
+      ,AmountChange = Amount - AmountPrior
+      ,AmountChangePercPrior = AmountChange/AmountPrior
+      ,AmountChangePercTrend = AmountChange/Predict_TrendLong
+    ) %>% ungroup() %>%
+    select(Date,ReportLevel4Key,StayLengthKey,AmountChangePercPrior,AmountChangePercTrend) %>%
+    rename(
+      ATVChangePercPrior = AmountChangePercPrior
+      ,ATVChangePercTrend = AmountChangePercTrend
+    )
+  
+  dfMain <-
+    dfMain %>%
+    left_join(
+      tmpATV
+      ,by=c("Date","ReportLevel4Key","StayLengthKey")
+    )
+  
+  rm(tmpATV)
+  
+  plot_LongTermTrend <-
+    dfMain %>%
+    dplyr::filter(
+      ReportLevel4Key == sample_ReportLevel4Key
+      & DimAmountTypeKey == sample_DimAmountTypeKey
+      & StayLengthKey == sample_StayLengthKey
+    ) %>%
+    ggplot() +
+    geom_point(aes(Date,Amount),fill = "blue", alpha = 0.2) +
+    geom_line(aes(Date,Predict_TrendLong, col = "Centered Moving Average"), size = 1.2) +
+    geom_smooth(aes(Date,Amount, col = "Linear regression"),method = "lm", se = F) +
+    labs(
+      title = "Actual Sales Volume & Long Term Trend"
+      ,subtitle = "Using a centered moving average as a long term trend approximation"
+    ) +
+    theme_classic()
+  
+  plot_StationaryTimeSeries <-
+    dfMain %>%
+    dplyr::filter(
+      ReportLevel4Key == sample_ReportLevel4Key
+      & DimAmountTypeKey == sample_DimAmountTypeKey
+      & StayLengthKey == sample_StayLengthKey
+    ) %>%
+    ggplot(aes(Date,Residual_TrendLong)) +
+    geom_point(fill = "blue", alpha = 0.2) +
+    geom_smooth(method = "lm", se = F) +
+    labs(
+      title = "De-Trended Time Series - Stationary"
+      ,subtitle = "The time series is detrended by removing the long term trend (approx. Centered Moving Average)"
+    ) +
+    theme_classic()
+
+## 12 Partition primary data frame ----
+## Test proportion 0.2 used to simulate real world usage; in operational envrionment, analysis generally uses as much historical data as possible.
+## Higher test proportion can be used but can lead to over training
+  
+  set.seed(112358, sample.kind = "Rounding")
+  
+  testIndex <- createDataPartition(y = dfMain$Amount, times = 1, p = 0.2, list = FALSE)
+  
+  dfTest <- dfMain[testIndex,]
+  dfTrain <- dfMain[-testIndex,]
+  
+# 13 Initial time Series EDA ----
+  
+  plot_initial_timeseries_long <- 
+    dfTrain %>%
+    dplyr::filter(
+      ReportLevel4Key == sample_ReportLevel4Key
+      & DimAmountTypeKey == sample_DimAmountTypeKey
+      & StayLengthKey == sample_StayLengthKey
+      & Date >= "2019-02-01" & Date <= "2019-08-31"
+    ) %>%
+    ggplot(aes(Date,Amount)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = F) +
+    geom_smooth(method = "loess", se = F, span = 0.1,linetype = "dashed") +
+    labs(
+      title = "Actual Sales Volume"
+      ,subtitle = paste0("For carpark ID 24 and customers that for 3 - 4 days.")
+    ) +
+    theme_classic()
+  
+  plot_initial_timeseries_short <- 
+    dfTrain %>%
+    dplyr::filter(
+      ReportLevel4Key == sample_ReportLevel4Key
+      & DimAmountTypeKey == sample_DimAmountTypeKey
+      & StayLengthKey == sample_StayLengthKey
+      & Date >= "2019-02-01" & Date <= "2019-02-28"
+    ) %>%
+    ggplot(aes(Date,Amount)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = F) +
+    geom_smooth(method = "loess", se = F, span = 0.1,linetype = "dashed") +
+    labs(
+      title = "Actual Sales Volume"
+      ,subtitle = paste0("For carpark ID 24 and customers that for 3 - 4 days.")
+    ) +
+    theme_classic()
+  
+  plot_initial_timeseries_monthly <- 
+    dfTrain %>%
+    dplyr::filter(
+      ReportLevel4Key == sample_ReportLevel4Key
+      & DimAmountTypeKey == sample_DimAmountTypeKey
+      & StayLengthKey == sample_StayLengthKey
+      & Date >= "2018-01-01" & Date <= "2019-12-31"
+    ) %>%
+    group_by(year(Date),MonthNo) %>%
+    mutate(
+      Amount = mean(Amount)
+    ) %>% ungroup() %>%
+    mutate(
+      MonthNo = factor(MonthNo,levels=1:12,ordered = T)
+    ) %>%
+    ggplot(aes(Date,Amount)) +
+    geom_line() +
+    geom_smooth(method = "lm",se = F) +
+    labs(
+      title = "Average Daily Sales Volume - Stratified By Month"
+      ,subtitle = paste0("Linear regression line shows seasonal over and underperformance of groups of months")
+    ) +
+    theme_classic()
+  
+## 20 Calculate Seasonality components ----
+  
+  ## __20_1 Calculate Month Impact ----
+
+  vct_group_PredSeasonalMonth <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MonthNo")
+  vct_select_PredSeasonalMonth <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MonthNo","TrendLongRatio")
+  
+      ##____20_1_1 Generate pre-calc plot
+        plot_PreMonth <-
+          dfTrain %>%
+          mutate(
+            MonthNo = factor(MonthNo, levels = 1:12, ordered = T)
+          ) %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalMonth) %>%
+          summarize(
+            MonthAvg = mean(Residual_TrendLong/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(MonthNo,MonthAvg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Pre Month Seasonality Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Month Number (1 = January)"
+          ) + 
+          theme_classic() 
+
+  
+      ##____20_1_2 Calculate sensitivities
+
+        df_Pred_SeasonalMonth <-
+          dfTrain %>%
+          group_by_at(vct_group_PredSeasonalMonth) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_TrendLong/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+      ##____20_1_3 Translate sensitivities into actual values
+        dfTrain <-
+          dfTrain %>%
+          inner_join(
+            df_Pred_SeasonalMonth
+            ,by = vct_group_PredSeasonalMonth
+          ) %>%
+          mutate(
+            Predict_SeasonalMonth = TrendLongRatio * Predict_TrendLong
+            ,Residual_SeasonalMonth = Residual_TrendLong - Predict_SeasonalMonth
+            ,Agg_Predict_SeasonalMonth = Predict_TrendLong + Predict_SeasonalMonth
+          ) %>% select(-TrendLongRatio)
+        
+      ##____20_1_4 Generate post-calc plot
+        plot_PostMonth <-
+          dfTrain %>%
+          mutate(
+            MonthNo = factor(MonthNo, levels = 1:12, ordered = T)
+          ) %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalMonth) %>%
+          summarize(
+            MonthAvg = mean(Residual_SeasonalMonth/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(MonthNo,MonthAvg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Post Month Seasonality Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Month Number (1 = January)"
+          ) + 
+          theme_classic() 
+        
+        
+  ## __20_2 Calculate DOW Impact ----
+        
+        vct_group_PredSeasonalDOW <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","DayNoWeek")
+        vct_select_PredSeasonalDOW <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","DayNoWeek","TrendLongRatio")
+        
+        ##____20_2_1 Generate pre-calc plot
+        plot_PreDOW <-
+          dfTrain %>%
+          mutate(
+            DayNoWeek = factor(DayNoWeek, levels = 1:7, ordered = T)
+          ) %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalDOW) %>%
+          summarize(
+            DOWAvg = mean(Residual_SeasonalMonth/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(DayNoWeek,DOWAvg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Pre Day Of Week Seasonal Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week Number (1 = Sunday)"
+          ) + 
+          theme_classic() 
+        
+        ##____20_2_2 Calculate sensitivities
+
+        df_Pred_SeasonalDOW <-
+          dfTrain %>%
+          group_by_at(vct_group_PredSeasonalDOW) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_SeasonalMonth/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____20_2_3 Translate sensitivities into actual values
+        dfTrain <-
+          dfTrain %>%
+          inner_join(
+            df_Pred_SeasonalDOW
+            ,by = vct_group_PredSeasonalDOW
+          ) %>%
+          mutate(
+            Predict_SeasonalDOW = TrendLongRatio * Predict_TrendLong
+            ,Residual_SeasonalDOW = Residual_SeasonalMonth - Predict_SeasonalDOW
+            ,Agg_Predict_SeasonalDOW = Agg_Predict_SeasonalMonth + Predict_SeasonalDOW
+          ) %>% select(-TrendLongRatio)
+        
+        ##____20_2_4 Generate post-calc plot
+        plot_PostDOW <-
+          dfTrain %>%
+          mutate(
+            DayNoWeek = factor(DayNoWeek, levels = 1:7, ordered = T)
+          ) %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalDOW) %>%
+          summarize(
+            DOWAvg = mean(Residual_SeasonalDOW/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(DayNoWeek,DOWAvg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Post Day Of Week Seasonal Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week Number (1 = Sunday)"
+          ) + 
+          theme_classic() 
+        
+        
+  ## __20_3 Calculate School Holiday ----  
+        
+        vct_group_PredSeasonalSchoolHoliday <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","SchoolHolidayDesc")
+        vct_select_PredSeasonalSchoolHoliday <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","SchoolHolidayDesc","TrendLongRatio")
+        
+        ##____20_3_1 Generate pre-calc plot
+        plot_PreSchoolHoliday <-
+          dfTrain %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalSchoolHoliday) %>%
+          summarize(
+            Avg = mean(Residual_SeasonalDOW/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(SchoolHolidayDesc,Avg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Pre School Holiday Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "School Holiday Description"
+          ) + 
+          theme_classic() 
+        
+        ##____20_3_2 Calculate sensitivities
+
+        df_Pred_SeasonalSchoolHoliday <-
+          dfTrain %>%
+          group_by_at(vct_group_PredSeasonalSchoolHoliday) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_SeasonalDOW/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____20_3_3 Translate sensitivities into actual values
+        dfTrain <-
+          dfTrain %>%
+          inner_join(
+            df_Pred_SeasonalSchoolHoliday
+            ,by = vct_group_PredSeasonalSchoolHoliday
+          ) %>%
+          mutate(
+            Predict_SeasonalSchoolHoliday= TrendLongRatio * Predict_TrendLong
+            ,Residual_SeasonalSchoolHoliday = Residual_SeasonalDOW - Predict_SeasonalSchoolHoliday
+            ,Agg_Predict_SeasonalSchoolHoliday = Agg_Predict_SeasonalDOW + Predict_SeasonalSchoolHoliday
+          ) %>% select(-TrendLongRatio)
+        
+        ##____20_3_4 Generate post-calc plot
+        plot_PostSchoolHoliday <-
+          dfTrain %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalSchoolHoliday) %>%
+          summarize(
+            Avg = mean(Residual_SeasonalSchoolHoliday/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(SchoolHolidayDesc,Avg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Post School Holiday Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "School Holiday Description"
+          ) + 
+          theme_classic() 
+
+        
+        
+## __20_4 Calculate Influential Dates ----  
+        
+        vct_group_PredSeasonalInfluentialDate <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","InfluentialDateCust1")
+        vct_select_PredSeasonalInfluentialDate <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","InfluentialDateCust1","TrendLongRatio")
+        
+        ##____20_4_1 Generate pre-calc plot
+        plot_PreInfluentialDate <-
+          dfTrain %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalInfluentialDate) %>%
+          summarize(
+            Avg = mean(Residual_SeasonalSchoolHoliday/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(InfluentialDateCust1,Avg)) +
+          geom_bar(stat="identity") +
+          scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+          labs(
+            title = "Pre Influential Date Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Influential Date Description"
+          ) + 
+          theme_classic() +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust = 1)
+          )
+        
+        ##____20_4_2 Calculate sensitivities
+
+        df_Pred_SeasonalInfluentialDate <-
+          dfTrain %>%
+          group_by_at(vct_group_PredSeasonalInfluentialDate) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_SeasonalSchoolHoliday/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____20_4_3 Translate sensitivities into actual values
+        dfTrain <-
+          dfTrain %>%
+          inner_join(
+            df_Pred_SeasonalInfluentialDate
+            ,by = vct_group_PredSeasonalInfluentialDate
+          ) %>%
+          mutate(
+            Predict_SeasonalInfluentialDate = TrendLongRatio * Predict_TrendLong
+            ,Residual_SeasonalInfluentialDate = Residual_SeasonalSchoolHoliday - Predict_SeasonalInfluentialDate
+            ,Agg_Predict_SeasonalInfluentialDate = Agg_Predict_SeasonalSchoolHoliday + Predict_SeasonalInfluentialDate
+          ) %>% select(-TrendLongRatio)
+        
+        ##____20_4_4 Generate post-calc plot
+        plot_PostInfluentialDate <-
+          dfTrain %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by_at(vct_group_PredSeasonalInfluentialDate) %>%
+          summarize(
+            Avg = mean(Residual_SeasonalInfluentialDate/Predict_TrendLong)
+          ) %>%
+          ggplot(aes(InfluentialDateCust1,Avg)) +
+          geom_bar(stat="identity") +
+          labs(
+            title = "Post Influential Date Impact"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Influential Date Description"
+          ) + 
+          theme_classic() +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) 
+
+        
+## 21 Calculate Non Seasonal Components ----
+        
+    ## Filtering due to lack of complete history of google analytics data
+    dfTrain_EDM <- dfTrain %>% dplyr::filter(Date >= date_all_components_start)
+        
+## __21_1 Calculate EDM Initial Impact ----  
+        
+        vct_group_PredEDMMajorAvg <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType")
+        vct_select_PredEDMMajorAvg <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType","TrendLongRatio")
+        
+        ##____21_1_1 Generate pre-calc plot
+        plot_PreEDMMajorAvg <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by(StayLengthKey,MajorEDMType) %>%
+          summarize(
+            Avg = mean(Residual_SeasonalInfluentialDate/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Pre Average EDM Impact"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length ID"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+    
+        ##____21_1_2 Calculate sensitivities
+        df_Pred_EDMMajorAvg <-
+          dfTrain_EDM %>%
+          group_by_at(vct_group_PredEDMMajorAvg) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_SeasonalInfluentialDate/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_1_3 Translate sensitivities into actual values
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          inner_join(
+            df_Pred_EDMMajorAvg
+            ,by = vct_group_PredEDMMajorAvg
+          ) %>%
+          mutate(
+            Predict_EDMMajorAvg = TrendLongRatio * Predict_TrendLong
+            ,Residual_EDMMajorAvg = Residual_SeasonalInfluentialDate - Predict_EDMMajorAvg
+            ,Agg_Predict_EDMMajorAvg = Agg_Predict_SeasonalInfluentialDate + Predict_EDMMajorAvg
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_1_4 Generate post-calc plot
+        plot_PostEDMMajorAvg <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by(StayLengthKey,MajorEDMType) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorAvg/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Post Average EDM Impact"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length ID"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+## __21_2 Calculate EDM Monthly Impact ----  
+
+        vct_group_PredEDMMajorMonth <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType","MonthNo")
+        vct_select_PredEDMMajorMonth <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType","MonthNo","TrendLongRatio")
+        
+        ##____21_2_1 Generate pre-calc plot
+        plot_PreEDMMajorMonth <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          mutate(
+            MonthNo = factor(MonthNo,levels = 1:12,ordered = T)
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorMonth) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorAvg/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(MonthNo,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Pred EDM Impact - Stratified By Month"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Month Number (1 = January)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        
+        ##____21_2_2 Calculate sensitivities
+        df_Pred_EDMMajorMonth <-
+          dfTrain_EDM %>%
+          group_by_at(vct_group_PredEDMMajorMonth) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_EDMMajorAvg/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_2_3 Translate sensitivities into actual values
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          inner_join(
+            df_Pred_EDMMajorMonth
+            ,by = vct_group_PredEDMMajorMonth
+          ) %>%
+          mutate(
+            Predict_EDMMajorMonth = TrendLongRatio * Predict_TrendLong
+            ,Residual_EDMMajorMonth = Residual_EDMMajorAvg - Predict_EDMMajorMonth
+            ,Agg_Predict_EDMMajorMonth = Agg_Predict_EDMMajorAvg + Predict_EDMMajorMonth
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_2_4 Generate post-calc plot
+        plot_PostEDMMajorMonth <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          mutate(
+            MonthNo = factor(MonthNo,levels = 1:12,ordered = T)
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorMonth) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorMonth/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(MonthNo,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Post EDM Impact - Stratified By Month"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Month Number (1 = January)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+## __21_3 Calculate EDM Day Of Week Impact ----  
+
+        vct_group_PredEDMMajorDOW <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType","DayNoWeek")
+        vct_select_PredEDMMajorDOW <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMType","DayNoWeek","TrendLongRatio")
+        
+        ##____21_3_1 Generate pre-calc plot
+        plot_PreEDMMajorDOW <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          mutate(
+            DayNoWeek = factor(DayNoWeek, levels = 1:7, ordered = T)
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorDOW) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorMonth/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(DayNoWeek,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Pre EDM Impact - Stratified By Day Of Week"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week (1 = Monday)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        
+        ##____21_3_2 Calculate sensitivities
+        df_Pred_EDMMajorDOW <-
+          dfTrain_EDM %>%
+          group_by_at(vct_group_PredEDMMajorDOW) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_EDMMajorMonth/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_3_3 Translate sensitivities into actual values
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          inner_join(
+            df_Pred_EDMMajorDOW
+            ,by =vct_group_PredEDMMajorDOW
+          ) %>%
+          mutate(
+            Predict_EDMMajorDOW = TrendLongRatio * Predict_TrendLong
+            ,Residual_EDMMajorDOW = Residual_EDMMajorMonth - Predict_EDMMajorDOW
+            ,Agg_Predict_EDMMajorDOW = Agg_Predict_EDMMajorMonth + Predict_EDMMajorDOW
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_3_4 Generate post-calc plot
+        plot_PostEDMMajorDOW <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          mutate(
+            DayNoWeek = factor(DayNoWeek,levels = 1:7,ordered=T)
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorDOW) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorDOW/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(DayNoWeek,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(~MajorEDMType) +
+          labs(
+            title = "Post EDM Impact - Stratified By Day Of Week"
+            ,subtitle = "Panel 0 = No EDM, 1 = Normal Major EDM, 2 = Limited Time Offer EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week (1 = Sunday)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        
+        
+## __21_4 Calculate EDM Lagged Initial Impact ----  
+ 
+        vct_group_PredEDMMajorLaggedAvg<- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","PriorEDMType","MajorEDMLaggedFlag")
+        vct_select_PredEDMMajorLaggedAvg <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","PriorEDMType","MajorEDMLaggedFlag","TrendLongRatio")
+               
+        ##____21_4_1 Generate pre-calc plot
+        plot_PreEDMMajorLaggedAvg <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by(StayLengthKey,PriorEDMType,MajorEDMLaggedFlag) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorDOW/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(MajorEDMLaggedFlag~PriorEDMType) +
+          labs(
+            title = "Pre Average EDM Lagged Impact"
+            ,subtitle = "Panel major title, TRUE = Within 3 days of EDM, FALSE = More than 3 days of EDM \nPanel minor title, 1 = Prior EDM was normal, 2 = Prior EDM was limited time offer"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length Key"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        ##____21_4_2 Calculate sensitivities
+        df_Pred_EDMMajorLaggedAvg <-
+          dfTrain_EDM %>%
+          group_by_at(vct_group_PredEDMMajorLaggedAvg) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_EDMMajorDOW/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_4_3 Translate sensitivities into actual values
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          inner_join(
+            df_Pred_EDMMajorLaggedAvg
+            ,by = vct_group_PredEDMMajorLaggedAvg
+          ) %>%
+          mutate(
+            Predict_EDMMajorLaggedAvg = TrendLongRatio * Predict_TrendLong
+            ,Residual_EDMMajorLaggedAvg = Residual_EDMMajorDOW - Predict_EDMMajorLaggedAvg
+            ,Agg_Predict_EDMMajorLaggedAvg = Agg_Predict_EDMMajorDOW + Predict_EDMMajorLaggedAvg
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_1_4 Generate post-calc plot
+        plot_PostEDMMajorLaggedAvg <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+          ) %>%
+          group_by(StayLengthKey,PriorEDMType,MajorEDMLaggedFlag) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorLaggedAvg/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(MajorEDMLaggedFlag~PriorEDMType) +
+          labs(
+            title = "Post Average EDM Lagged Impact"
+            ,subtitle = "Panel major title, TRUE = Within 3 days of EDM, FALSE = More than 3 days of EDM \nPanel minor title, 1 = Prior EDM was normal, 2 = Prior EDM was limited time offer"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length Key"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+## __21_5 Calculate EDM Lagged Days Impact ----  
+        
+        vct_group_PredEDMMajorLaggedDays<- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","PriorEDMType","MajorEDMLaggedFlag","DaysFromEDMStart")
+        vct_select_PredEDMMajorLaggedDays <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","PriorEDMType","MajorEDMLaggedFlag","DaysFromEDMStart","TrendLongRatio")
+        
+        ##____21_5_1 Generate pre-calc plot
+        plot_PreEDMMajorLaggedDays <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & MajorEDMLaggedFlag == T
+          ) %>%
+          mutate(
+            FacetTitle1 = paste0("Days Lagged ", DaysFromEDMStart)
+            ,FacetTitle2 = paste0("Prior EDM Type ",PriorEDMType)
+          ) %>%
+          group_by(StayLengthKey,FacetTitle1,FacetTitle2) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorDOW/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(FacetTitle1~FacetTitle2,ncol =2,scales="free") +
+          labs(
+            title = "Pre EDM Lagged Impact - Days After"
+            ,subtitle = "Panel major title, Number of days after an EDM \nPanel minor title, 1 = Prior EDM was normal, 2 = Prior EDM was limited time offer"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length Key"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        ##____21_5_2 Calculate sensitivities
+        df_Pred_EDMMajorLaggedDays <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            MajorEDMLaggedFlag == T
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorLaggedDays) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_EDMMajorLaggedAvg/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_5_3 Translate sensitivities into actual values
+        ## The Predict calculation has to use a coalesce as only days with MajorEDMLaggedFlag as TRUE has valid records.
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          left_join(
+            df_Pred_EDMMajorLaggedDays
+            ,by =vct_group_PredEDMMajorLaggedDays
+          ) %>%
+          mutate(
+            Predict_EDMMajorLaggedDays = coalesce(TrendLongRatio,0) * Predict_TrendLong
+            ,Residual_EDMMajorLaggedDays = Residual_EDMMajorLaggedAvg - Predict_EDMMajorLaggedDays
+            ,Agg_Predict_EDMMajorLaggedDays = Agg_Predict_EDMMajorLaggedAvg + Predict_EDMMajorLaggedDays
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_5_4 Generate post-calc plot
+        plot_PostEDMMajorLaggedDays <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & MajorEDMLaggedFlag == T
+          ) %>%
+          mutate(
+            FacetTitle1 = paste0("Days Lagged ", DaysFromEDMStart)
+            ,FacetTitle2 = paste0("Prior EDM Type ",PriorEDMType)
+          ) %>%
+          group_by(StayLengthKey,FacetTitle1,FacetTitle2) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorLaggedDays/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(StayLengthKey,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(FacetTitle1~FacetTitle2,ncol =2,scales="free") +
+          labs(
+            title = "Post EDM Lagged Impact - Days After"
+            ,subtitle = "Panel major title, Number of days after an EDM \nPanel minor title, 1 = Prior EDM was normal, 2 = Prior EDM was limited time offer"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Stay Length Key"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+## __21_6 Calculate EDM Lagged Days (DOW) Impact ----  
+        
+        vct_group_PredEDMMajorLaggedDaysDOW<- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMLaggedFlag","DayNoWeek","DaysFromEDMStart")
+        vct_select_PredEDMMajorLaggedDaysDOW <- c("ReportLevel4Key","StayLengthKey","DimAmountTypeKey","MajorEDMLaggedFlag","DayNoWeek","DaysFromEDMStart","TrendLongRatio")
+        
+        ##____21_6_1 Generate pre-calc plot
+        plot_PreEDMMajorLaggedDaysDOW <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & MajorEDMLaggedFlag == T
+            & StayLengthKey %in% c(9,14,18,22)
+          ) %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName,DayNoWeek,DaysFromEDMStart) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorLaggedDays/Predict_TrendLong)
+            ,Sign = factor(sign(Avg))
+          ) %>% ungroup() %>%
+          ggplot(aes(DayNoWeek,Avg,fill = Sign)) +
+          geom_bar(stat="identity") +
+          scale_fill_manual(values=c("green","red")) +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(StayLengthName~DaysFromEDMStart,ncol =3,scales="free") +
+          scale_x_continuous(breaks = 1:7) +
+          labs(
+            title = "Pre EDM Lagged Impact - Days After & Day Of Week"
+            ,subtitle = "Panel major title, Stay Length (Sample) \nPanel minor title, number of days after EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week (1 = Sunday)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        ##____21_6_2 Calculate sensitivities
+        df_Pred_EDMMajorLaggedDaysDOW <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            MajorEDMLaggedFlag == T
+          ) %>%
+          group_by_at(vct_group_PredEDMMajorLaggedDaysDOW) %>%
+          summarize(
+            TrendLongRatio = coalesce(mean(Residual_EDMMajorLaggedDays/Predict_TrendLong),0)
+          ) %>% ungroup()
+        
+        ##____21_6_3 Translate sensitivities into actual values
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          left_join(
+            df_Pred_EDMMajorLaggedDaysDOW
+            ,by = vct_group_PredEDMMajorLaggedDaysDOW
+          ) %>%
+          mutate(
+            Predict_EDMMajorLaggedDaysDOW = coalesce(TrendLongRatio,0) * Predict_TrendLong
+            ,Residual_EDMMajorLaggedDaysDOW = Residual_EDMMajorLaggedDays - Predict_EDMMajorLaggedDaysDOW
+            ,Agg_Predict_EDMMajorLaggedDaysDOW = Agg_Predict_EDMMajorLaggedDays + Predict_EDMMajorLaggedDaysDOW
+          ) %>% select(-TrendLongRatio)
+        
+        ##____21_6_4 Generate post-calc plot
+        plot_PostEDMMajorLaggedDays <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & MajorEDMLaggedFlag == T
+            & StayLengthKey %in% c(9,14,18,22)
+          ) %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName,DayNoWeek,DaysFromEDMStart) %>%
+          summarize(
+            Avg = mean(Residual_EDMMajorLaggedDaysDOW/Predict_TrendLong)
+          ) %>% ungroup() %>%
+          ggplot(aes(DayNoWeek,Avg)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust =1)
+          ) +
+          facet_wrap(StayLengthName~DaysFromEDMStart,ncol =3,scales="free") +
+          scale_x_continuous(breaks = 1:7) +
+          labs(
+            title = "Post EDM Lagged Impact - Days After & Day Of Week"
+            ,subtitle = "Panel major title, Stay Length (Sample) \nPanel minor title, number of days after EDM"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "Day Of Week (1 = Sunday)"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+      
+## 22 Calculate EDM Initial Regression ----          
+        
+##__22_1 Regression by Month ----
+        
+        ##____22_1_1 Initialise temporary table
+        tmp_dfTrainEDMMajorMonthRgr <- 
+          dfTrain_EDM %>% 
+            dplyr::filter(
+              MajorEDMFlag == 1
+            ) %>%
+            inner_join(
+              select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+              ,by="Date"
+            ) %>%
+            dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+            mutate(
+              Predict_Ratio_EDMMajorMonthRgr = coalesce(Residual_EDMMajorLaggedDaysDOW/Predict_TrendLong,0)
+            ) %>%
+            select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,DayNoWeek
+                   ,Predict_TrendLong,Residual_EDMMajorLaggedDaysDOW,Predict_Ratio_EDMMajorMonthRgr,AmountTotalCampaignSent)
+          
+        ##____22_1_2 Generate pre calc plot
+        plot_PreEDMMajorMonthRgr <-
+          tmp_dfTrainEDMMajorMonthRgr %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & StayLengthKey == sample_StayLengthKey
+          ) %>%
+          ggplot(aes(AmountTotalCampaignSent,Predict_Ratio_EDMMajorMonthRgr)) +
+          geom_point() +
+          geom_smooth(method = "lm", se = F) +
+          facet_wrap(~MonthNo, scales = "free") +
+          labs(
+            title = "Pre EDM Total Campaign Volume - Stratified By Month"
+            ,subtitle = "Panel Major Title, Month Number (1 = January)"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "EDM Volume"
+          ) +
+          scale_x_continuous(labels = function(x) paste0(round(x/1000,0),"K")) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+            ,axis.text.x = element_text(angle = 45, hjust = 1)
+          )
+        
+        ##____22_1_3 Generate regression coefficients
+        df_Pred_EDMMajorMonthRgr <-
+          tmp_dfTrainEDMMajorMonthRgr %>%
+          group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo) %>% nest() %>%
+          mutate(
+            data_fun = map(data,function(x){
+              df_map <- as_tibble(x) %>%
+                do(tidy(lm(Predict_Ratio_EDMMajorMonthRgr~AmountTotalCampaignSent, data = .),conf.int = F))
+            })
+          ) %>% unnest(data_fun) %>% select(-data) %>% ungroup() %>%
+          mutate(
+            term = ifelse(term == "(Intercept)","Intercept",term)
+          ) %>%
+          rename(
+            CoefficientName = term
+            ,CoefficientValue = estimate
+          )
+        
+        rm(tmp_dfTrainEDMMajorMonthRgr)
+        
+        ##____22_1_4 Translate regression into the relevant predict ratios
+        ## Values are stored into a temp table, to be removed after applying them to each PredictTrend Long
+        tmp_EDMMajorMonthRgr_Ratio <- 
+          dfTrain_EDM %>%
+          dplyr::filter(
+            MajorEDMFlag == 1
+          ) %>%
+          left_join(
+            select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+            ,by=c("Date")
+          ) %>%
+          dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,AmountTotalCampaignSent) %>%
+          mutate(
+            Intercept = 1
+          ) %>%
+          gather(CoefficientName,amount,-c(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo)) %>%
+          left_join(
+            select(df_Pred_EDMMajorMonthRgr,-c(std.error,statistic,p.value))
+            ,by=c("ReportLevel4Key","DimAmountTypeKey","StayLengthKey","MonthNo","CoefficientName")
+          ) %>%
+          mutate(
+            Predict_Ratio_EDMMajorMonthRgr = CoefficientValue * amount
+          ) %>%
+          group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+          summarize(
+            Predict_Ratio_EDMMajorMonthRgr = sum(Predict_Ratio_EDMMajorMonthRgr)
+          ) %>% ungroup()
+        
+        ##____22_1_5 Reintegrate ratio results to main data frame
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          left_join(
+            tmp_EDMMajorMonthRgr_Ratio
+            ,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")
+          ) %>%
+          mutate(
+            Predict_EDMMajorMonthRgr = coalesce(Predict_Ratio_EDMMajorMonthRgr,0) * Predict_TrendLong
+            ,Residual_EDMMajorMonthRgr = Residual_EDMMajorLaggedDaysDOW - Predict_EDMMajorMonthRgr
+            ,Agg_Predict_EDMMajorMonthRgr = Agg_Predict_EDMMajorLaggedDaysDOW + Predict_EDMMajorMonthRgr
+          ) %>%
+          select(-Predict_Ratio_EDMMajorMonthRgr)
+        
+        rm(tmp_EDMMajorMonthRgr_Ratio)
+        
+        ##____22_1_6 Generate post-calc plots
+        tmp_dfTrainEDMMajorMonthRgr <- 
+          dfTrain_EDM %>% 
+          dplyr::filter(
+            MajorEDMFlag == 1
+          ) %>%
+          inner_join(
+            select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+            ,by="Date"
+          ) %>%
+          dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+          mutate(
+            Predict_Ratio_EDMMajorMonthRgr = coalesce(Residual_EDMMajorMonthRgr/Predict_TrendLong,0)
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,DayNoWeek
+                 ,Predict_TrendLong,Residual_EDMMajorMonthRgr,Predict_Ratio_EDMMajorMonthRgr,AmountTotalCampaignSent)
+        
+        plot_PostEDMMajorMonthRgr <-
+          tmp_dfTrainEDMMajorMonthRgr %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & StayLengthKey == sample_StayLengthKey
+          ) %>%
+          ggplot(aes(AmountTotalCampaignSent,Predict_Ratio_EDMMajorMonthRgr)) +
+          geom_point() +
+          geom_smooth(method = "lm", se = F) +
+          facet_wrap(~MonthNo, scales = "free") +
+          labs(
+            title = "Post EDM Total Campaign Volume - Stratified By Month"
+            ,subtitle = "Panel Major Title, Month Number (1 = January)"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "EDM Volume"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        rm(tmp_dfTrainEDMMajorMonthRgr)
+        
+##__22_2 Regression by DOW ----
+        
+        ##____22_2_1 Initialise temporary table
+        tmp_dfTrainEDMMajorDOWRgr <- 
+          dfTrain_EDM %>% 
+          dplyr::filter(
+            MajorEDMFlag == 1
+          ) %>%
+          inner_join(
+            select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+            ,by="Date"
+          ) %>%
+          dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+          mutate(
+            Predict_Ratio_EDMMajorDOWRgr = coalesce(Residual_EDMMajorMonthRgr/Predict_TrendLong,0)
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,DayNoWeek
+                 ,Predict_TrendLong,Residual_EDMMajorMonthRgr,Predict_Ratio_EDMMajorDOWRgr,AmountTotalCampaignSent)
+        
+        ##____22_2_2 Generate pre calc plot
+        plot_PreEDMMajorDOWRgr <-
+          tmp_dfTrainEDMMajorDOWRgr %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & StayLengthKey == sample_StayLengthKey
+          ) %>%
+          ggplot(aes(AmountTotalCampaignSent,Predict_Ratio_EDMMajorDOWRgr)) +
+          geom_point() +
+          geom_smooth(method = "lm", se = F) +
+          facet_wrap(~DayNoWeek, scales = "free") +
+          scale_x_continuous(labels = function(x) paste0(round(x/1000,0),"K")) +
+          labs(
+            title = "Post EDM Total Campaign Volume - Stratified By Day Of Week"
+            ,subtitle = "Panel Major Title, Day Of Week (1 = Sunday)"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "EDM Volume"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+            ,axis.text.x = element_text(angle = 45, hjust = 1)
+          )
+        
+        ##____22_2_3 Generate regression coefficients
+        df_Pred_EDMMajorDOWRgr <-
+          tmp_dfTrainEDMMajorDOWRgr %>%
+          group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DayNoWeek) %>% nest() %>%
+          mutate(
+            data_fun = map(data,function(x){
+              df_map <- as_tibble(x) %>%
+                do(tidy(lm(Predict_Ratio_EDMMajorDOWRgr~AmountTotalCampaignSent, data = .),conf.int = F))
+            })
+          ) %>% unnest(data_fun) %>% select(-data) %>% ungroup() %>%
+          mutate(
+            term = ifelse(term == "(Intercept)","Intercept",term)
+          ) %>%
+          rename(
+            CoefficientName = term
+            ,CoefficientValue = estimate
+          )
+        
+        rm(tmp_dfTrainEDMMajorDOWRgr)
+        
+        ##____22_2_4 Translate regression into the relevant predict ratios
+        ## Values are stored into a temp table, to be removed after applying them to each PredictTrend Long
+        tmp_EDMMajorDOWRgr_Ratio <- 
+          dfTrain_EDM %>%
+          dplyr::filter(
+            MajorEDMFlag == 1
+          ) %>%
+          left_join(
+            select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+            ,by=c("Date")
+          ) %>%
+          dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DayNoWeek,AmountTotalCampaignSent) %>%
+          mutate(
+            Intercept = 1
+          ) %>%
+          gather(CoefficientName,amount,-c(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DayNoWeek)) %>%
+          left_join(
+            select(df_Pred_EDMMajorDOWRgr,-c(std.error,statistic,p.value))
+            ,by=c("ReportLevel4Key","DimAmountTypeKey","StayLengthKey","DayNoWeek","CoefficientName")
+          ) %>%
+          mutate(
+            Predict_Ratio_EDMMajorDOWRgr = CoefficientValue * amount
+          ) %>%
+          group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+          summarize(
+            Predict_Ratio_EDMMajorDOWRgr = sum(Predict_Ratio_EDMMajorDOWRgr)
+          ) %>% ungroup()
+        
+        ##____22_2_5 Reintegrate ratio results to main data frame
+        dfTrain_EDM <-
+          dfTrain_EDM %>%
+          left_join(
+            tmp_EDMMajorDOWRgr_Ratio
+            ,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")
+          ) %>%
+          mutate(
+            Predict_EDMMajorDOWRgr = coalesce(Predict_Ratio_EDMMajorDOWRgr,0) * Predict_TrendLong
+            ,Residual_EDMMajorDOWRgr = Residual_EDMMajorMonthRgr - Predict_EDMMajorDOWRgr
+            ,Agg_Predict_EDMMajorDOWRgr = Agg_Predict_EDMMajorMonthRgr + Predict_EDMMajorDOWRgr
+          ) %>%
+          select(-Predict_Ratio_EDMMajorDOWRgr)
+      
+        rm(tmp_EDMMajorDOWRgr_Ratio)
+        
+        ##____22_1_6 Generate post-calc plots
+        tmp_dfTrainEDMMajorDOWRgr <- 
+          dfTrain_EDM %>% 
+          dplyr::filter(
+            MajorEDMFlag == 1
+          ) %>%
+          inner_join(
+            select(FactCampaignMajorClean,Date,AmountTotalCampaignSent)
+            ,by="Date"
+          ) %>%
+          dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+          mutate(
+            Predict_Ratio_EDMMajorDOWRgr = coalesce(Residual_EDMMajorDOWRgr/Predict_TrendLong,0)
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,DayNoWeek
+                 ,Predict_TrendLong,Residual_EDMMajorMonthRgr,Predict_Ratio_EDMMajorDOWRgr,AmountTotalCampaignSent)
+        
+        plot_PostEDMMajorDOWRgr <-
+          tmp_dfTrainEDMMajorDOWRgr %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & StayLengthKey == sample_StayLengthKey
+          ) %>%
+          ggplot(aes(AmountTotalCampaignSent,Predict_Ratio_EDMMajorDOWRgr)) +
+          geom_point() +
+          geom_smooth(method = "lm", se = F) +
+          facet_wrap(~DayNoWeek, scales = "free") +
+          labs(
+            title = "Post EDM Total Campaign Volume - Stratified By Day Of Week"
+            ,subtitle = "Panel Major Title, Day Of Week (1 = Sunday)"
+            ,y = "Relative Residual to Long Term Trend"
+            ,x = "EDM Volume"
+          ) +
+          theme_classic() +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = 1)
+          )
+        
+        rm(tmp_dfTrainEDMMajorDOWRgr)        
+        
+## 29__Remaining Residuals ----
+        
+        tmpPriceResid <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            & DimAmountTypeKey == 103
+          ) %>% 
+          mutate(
+            ResidPerc = Residual_EDMMajorDOWRgr/Predict_TrendLong
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,ResidPerc,ATVChangePercPrior,ATVChangePercTrend,Amount)
+        
+        plotResidualPerc <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            # & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & Date >= "2019-01-01" & Date <= "2019-12-31"
+            # & DayNoWeek %in% c(2,4,6)
+          ) %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          dplyr::filter(
+            !StayLengthName %in% c("15 - 30 mins","30 - 60 mins","1 - 2 hours","2 - 3 hours","3 - 4 hours")
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthName,Residual_EDMMajorDOWRgr,Predict_TrendLong,Amount,DayNoWeek) %>%
+          mutate(
+            YearNo = year(Date)
+            ,WeekNo = week(Date)
+          ) %>%
+          group_by(YearNo,WeekNo) %>%
+          mutate(
+            StartOfWeek = min(Date)
+          ) %>% ungroup () %>% select(-YearNo,WeekNo) %>%
+          mutate(
+            PercVar = ifelse(abs(Residual_EDMMajorDOWRgr/Predict_TrendLong) >= 1,sign(Residual_EDMMajorDOWRgr/Predict_TrendLong)*1, Residual_EDMMajorDOWRgr/Predict_TrendLong)
+            ,AbsPercVar = abs(PercVar)
+          ) %>%
+          ggplot(aes(StayLengthName,StartOfWeek,fill=PercVar)) +
+          geom_tile(col = "white") +
+          scale_fill_gradient(low = "red", high = "green") +
+          scale_x_discrete(breaks =           
+                             DimStayLength %>%
+                             dplyr::filter(
+                               !StayLengthName %in% c("Not Applicable","Unknown","0 - 15 mins","15 - 30 mins","30 - 60 mins","1 - 2 hours","2 - 3 hours","3 - 4 hours")
+                               &  as.integer(StayLengthName) %% 2
+                             ) %>%
+                             distinct(StayLengthName) %>% pull()
+                           )+
+          coord_flip() +
+          facet_wrap(~DayNoWeek,scales = "free") +
+          labs(
+            title = "Percentage Model Residual Per Day Of Week"
+            ,subtitle = "For ReportLevel4Key 247\nIdeal percentage error should be 0."
+            ,x = "Stay Length"
+          ) +
+          theme_classic() +
+          theme(
+            axis.title.x = element_blank()
+            ,axis.text.x = element_text(angle = 60,hjust = 1)
+          )
+        
+        
+        kableResidualSample <-
+          dfTrain_EDM %>%
+          dplyr::filter(
+            ReportLevel4Key == sample_ReportLevel4Key
+            # & StayLengthKey == sample_StayLengthKey
+            & DimAmountTypeKey == sample_DimAmountTypeKey
+            & Date >= "2019-01-01" & Date <= "2019-12-31"
+            # & DayNoWeek %in% c(2,4,6)
+          ) %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          dplyr::filter(
+            !StayLengthName %in% c("15 - 30 mins","30 - 60 mins","1 - 2 hours","2 - 3 hours","3 - 4 hours")
+          ) %>%
+          select(Date,ReportLevel4Key,StayLengthName,Residual_EDMMajorDOWRgr,Predict_TrendLong,Amount) %>%
+          mutate(
+            PercVar = ifelse(abs(Residual_EDMMajorDOWRgr/Predict_TrendLong) >= 1,sign(Residual_EDMMajorDOWRgr/Predict_TrendLong)*1, Residual_EDMMajorDOWRgr/Predict_TrendLong)
+            ,AbsPercVar = abs(PercVar)
+          ) %>% 
+          group_by(StayLengthName) %>%
+          summarize(
+            `MAE (%)` = 100*round(mean(AbsPercVar),2)
+            ,`MBE (%)` = 100*round(mean(PercVar),2)
+            ,TotalPurchases = sum(Amount)
+          ) %>% ungroup() %>%
+          mutate(
+            `%` = round(100*TotalPurchases/sum(TotalPurchases),2)
+          ) %>%
+          knitr::kable()
+        
+        
+        CorATVChangePercPrior <-
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName) %>%
+          summarize(
+            Cor = cor(ATVChangePercPrior,ResidPerc,use="pairwise.complete.obs")
+            ,TotalPurchases = sum(Amount)
+          ) %>% knitr::kable()
+        
+        
+        CorATVChangePercTrend <-
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName) %>%
+          summarize(
+            Cor = cor(ATVChangePercTrend,ResidPerc,use="pairwise.complete.obs")
+            ,TotalPurchases = sum(Amount)
+          ) %>% knitr::kable()
+        
+        
+        CorATVAll <- 
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName) %>%
+          summarize(
+            `Against Trend` = round(cor(ATVChangePercTrend,ResidPerc,use="pairwise.complete.obs"),2)
+            ,`Against Prior Day` = round(cor(ATVChangePercPrior,ResidPerc,use="pairwise.complete.obs"),2)
+            ,TotalPurchases = sum(Amount)
+          ) %>% knitr::kable()
+        
+        
+        LinearRegressionATVChangePercPrior <- 
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName) %>% nest() %>%
+          mutate(
+            data_fun = map(data,function(x){
+              df_map <- as_tibble(x) %>%
+                do(tidy(lm(ResidPerc~ATVChangePercPrior, data = .),conf.int = F))
+            })
+          ) %>% unnest(data_fun) %>% select(-data) %>% ungroup() %>%
+          dplyr::filter(
+            term != "(Intercept)"
+          ) %>%
+          ggplot(aes(StayLengthName,p.value)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust = 1)
+          ) + coord_flip() +
+          theme_classic() +
+          labs(
+            title = "P.Values - Linear Regression of Residual Perc vs ATV Change Daily Perc"
+          )
+        
+        LinearRegressionATVChangePercTrend <- 
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          group_by(StayLengthName) %>% nest() %>%
+          mutate(
+            data_fun = map(data,function(x){
+              df_map <- as_tibble(x) %>%
+                do(tidy(lm(ResidPerc~ATVChangePercTrend, data = .),conf.int = F))
+            })
+          ) %>% unnest(data_fun) %>% select(-data) %>% ungroup() %>%
+          dplyr::filter(
+            term != "(Intercept)"
+          ) %>%
+          ggplot(aes(StayLengthName,p.value)) +
+          geom_bar(stat="identity") +
+          theme(
+            axis.text.x = element_text(angle = 90, hjust = 1)
+          ) + coord_flip() +
+          theme_classic() +
+          labs(
+            title = "P.Values - Linear Regression of Residual Perc vs ATV Change Trend Perc"
+          )
+        
+        PlotLinearRegressionATVChangePercPrior <-
+          tmpPriceResid %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          dplyr::filter(
+            StayLengthName %in% c("2 - 3 days","4 - 5 days","7 - 8 days","14 - 15 days","20 - 21 days")
+          ) %>%
+          ggplot(aes(ATVChangePercPrior,ResidPerc,col=StayLengthName)) +
+          geom_point() +
+          geom_smooth(method = "lm",se=F) +
+          theme_classic() +
+          labs(
+            title = "Linear Regression of Model Residual Perc vs ATV Change Daily Perc"
+          )
+        
+        PlotLinearRegressionATVChangePercTrend <-
+          tmpPriceResid %>%
+          mutate(
+            ResidPerc = round(100*ResidPerc,0)
+            ,ATVChangePercTrend = round(100*ATVChangePercTrend,0)
+          ) %>%
+          left_join(
+            select(DimStayLength,StayLengthKey,StayLengthName)
+            ,by="StayLengthKey"
+          ) %>%
+          dplyr::filter(
+            StayLengthName %in% c("2 - 3 days","4 - 5 days","7 - 8 days","14 - 15 days","20 - 21 days")
+          ) %>%
+          ggplot(aes(ATVChangePercTrend,ResidPerc,col=StayLengthName)) +
+          geom_point(alpha = 0.1) +
+          geom_smooth(method = "lm",se=F) +
+          theme_classic() +
+          labs(
+            title = "Linear Regression of Model Residual Perc vs ATV Change Trend Perc"
+          ) +
+          scale_y_continuous(limits = c(-100,100))
+        
+        rm(tmpPriceResid)
+        
+        
+        
+## 30__Create ML Transform Function ----
+## Create function to input a data.frame of the same format as dfMain and output training results         
+      
+
+          
+        
+        applyTrainingResults <- function(CoreResults,CampaignData){
+          CoreResults <- as_tibble(CoreResults)          
+          
+          CoreResults <- CoreResults %>%
+            dplyr::filter(Date >= min(CampaignData$Date) & DimAmountTypeKey == 103) %>%
+
+            ## Calculate non-regression results
+            left_join(select_at(df_Pred_SeasonalMonth,vct_select_PredSeasonalMonth),by = vct_group_PredSeasonalMonth) %>%
+            mutate(Predict_SeasonalMonth = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_SeasonalDOW,vct_select_PredSeasonalDOW),by = vct_group_PredSeasonalDOW) %>%
+            mutate(Predict_SeasonalDOW = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_SeasonalSchoolHoliday,vct_select_PredSeasonalSchoolHoliday),by = vct_group_PredSeasonalSchoolHoliday) %>%
+            mutate(Predict_SeasonalSchoolHoliday = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_SeasonalInfluentialDate,vct_select_PredSeasonalInfluentialDate), by = vct_group_PredSeasonalInfluentialDate) %>%
+            mutate(Predict_SeasonalInfluentialDate = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorAvg,vct_select_PredEDMMajorAvg),by = vct_group_PredEDMMajorAvg) %>%
+            mutate(Predict_EDMMajorAvg = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorMonth,vct_select_PredEDMMajorMonth),by=vct_group_PredEDMMajorMonth) %>%
+            mutate(Predict_EDMMajorMonth = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorDOW,vct_select_PredEDMMajorDOW),by=vct_group_PredEDMMajorDOW) %>%
+            mutate(Predict_EDMMajorDOW = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorLaggedAvg,vct_select_PredEDMMajorLaggedAvg),by=vct_group_PredEDMMajorLaggedAvg) %>%
+            mutate(Predict_EDMMajorLaggedAvg = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorLaggedDays,vct_select_PredEDMMajorLaggedDays),by=vct_group_PredEDMMajorLaggedDays) %>%
+            mutate(Predict_EDMMajorLaggedDays = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio) %>%
+          
+            left_join(select_at(df_Pred_EDMMajorLaggedDaysDOW,vct_select_PredEDMMajorLaggedDaysDOW),by=vct_group_PredEDMMajorLaggedDaysDOW) %>%
+            mutate(Predict_EDMMajorLaggedDaysDOW = coalesce(TrendLongRatio * Predict_TrendLong,0)) %>% select(-TrendLongRatio)
+          
+          
+          ## Calculate EDM Major Regression by Month
+          tmp_EDMMajorMonthRgr_Ratio <-
+            CoreResults %>%
+            dplyr::filter(
+              MajorEDMFlag == 1
+            ) %>%
+            inner_join(
+              select(CampaignData,Date,AmountTotalCampaignSent)
+              ,by="Date"
+            ) %>%
+            dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+            select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo,AmountTotalCampaignSent) %>%
+            mutate(
+              Intercept = 1
+            ) %>%
+            gather(CoefficientName,amount,-c(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,MonthNo)) %>%
+            left_join(
+              select(df_Pred_EDMMajorMonthRgr,-c(std.error,statistic,p.value))
+              ,by=c("ReportLevel4Key","DimAmountTypeKey","StayLengthKey","MonthNo","CoefficientName")
+            ) %>%
+            mutate(
+              Predict_Ratio_EDMMajorMonthRgr = CoefficientValue * amount
+            ) %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+            summarize(
+              Predict_Ratio_EDMMajorMonthRgr = sum(Predict_Ratio_EDMMajorMonthRgr)
+            ) %>% ungroup()
+          
+          CoreResults <-
+            CoreResults %>%
+            left_join(
+              tmp_EDMMajorMonthRgr_Ratio
+              ,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")
+            ) %>%
+            mutate(
+              Predict_EDMMajorMonthRgr = coalesce(Predict_Ratio_EDMMajorMonthRgr,0) * Predict_TrendLong
+            ) %>%
+            select(-Predict_Ratio_EDMMajorMonthRgr)
+          
+          rm(tmp_EDMMajorMonthRgr_Ratio)
+          
+          ## Calculate EDM Major Regression by DOW
+          
+          tmp_EDMMajorDOWRgr_Ratio <-
+            CoreResults %>%
+            dplyr::filter(
+              MajorEDMFlag == 1
+            ) %>%
+            left_join(
+              select(CampaignData,Date,AmountTotalCampaignSent)
+              ,by=c("Date")
+            ) %>%
+            dplyr::filter(!is.na(AmountTotalCampaignSent)) %>%
+            select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DayNoWeek,AmountTotalCampaignSent) %>%
+            mutate(
+              Intercept = 1
+            ) %>%
+            gather(CoefficientName,amount,-c(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DayNoWeek)) %>%
+            left_join(
+              select(df_Pred_EDMMajorDOWRgr,-c(std.error,statistic,p.value))
+              ,by=c("ReportLevel4Key","DimAmountTypeKey","StayLengthKey","DayNoWeek","CoefficientName")
+            ) %>%
+            mutate(
+              Predict_Ratio_EDMMajorDOWRgr = CoefficientValue * amount
+            ) %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+            summarize(
+              Predict_Ratio_EDMMajorDOWRgr = sum(Predict_Ratio_EDMMajorDOWRgr)
+            ) %>% ungroup()
+          
+          CoreResults <-
+            CoreResults %>%
+            left_join(
+              tmp_EDMMajorDOWRgr_Ratio
+              ,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")
+            ) %>%
+            mutate(
+              Predict_EDMMajorDOWRgr = coalesce(Predict_Ratio_EDMMajorDOWRgr,0) * Predict_TrendLong
+            ) %>%
+            select(-Predict_Ratio_EDMMajorDOWRgr)
+          
+          rm(tmp_EDMMajorDOWRgr_Ratio)
+          
+          CoreResults <-
+            CoreResults %>%
+            select(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey
+                   ,Amount
+                   ,Predict_TrendLong,Predict_SeasonalMonth,Predict_SeasonalDOW,Predict_SeasonalSchoolHoliday,Predict_SeasonalInfluentialDate
+                   ,Predict_EDMMajorAvg,Predict_EDMMajorMonth,Predict_EDMMajorDOW
+                   ,Predict_EDMMajorLaggedAvg,Predict_EDMMajorLaggedDays,Predict_EDMMajorLaggedDaysDOW
+                   ,Predict_EDMMajorMonthRgr,Predict_EDMMajorDOWRgr) %>%
+            mutate(
+              Residual = Amount - (Predict_TrendLong+Predict_SeasonalMonth+Predict_SeasonalDOW+Predict_SeasonalSchoolHoliday+Predict_SeasonalInfluentialDate
+                                   +Predict_EDMMajorAvg+Predict_EDMMajorMonth+Predict_EDMMajorDOW
+                                   +Predict_EDMMajorLaggedAvg+Predict_EDMMajorLaggedDays+Predict_EDMMajorLaggedDaysDOW
+                                   +Predict_EDMMajorMonthRgr+Predict_EDMMajorDOWRgr
+                                  )
+            ) %>%
+            gather(DecompositionName,Amount,-c(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey)) %>%
+            mutate(
+              DecompositionName = factor(DecompositionName, levels = c("Amount"
+                                                                       ,"Predict_TrendLong","Predict_SeasonalMonth","Predict_SeasonalDOW","Predict_SeasonalSchoolHoliday","Predict_SeasonalInfluentialDate"
+                                                                       ,"Predict_EDMMajorAvg","Predict_EDMMajorMonth","Predict_EDMMajorDOW","Predict_EDMMajorMonthRgr","Predict_EDMMajorDOWRgr"
+                                                                       ,"Predict_EDMMajorLaggedAvg","Predict_EDMMajorLaggedDays","Predict_EDMMajorLaggedDaysDOW"
+                                                                       ,"Residual")
+                                         ,ordered = T)
+            )
+          
+          tmpDecompositionHierarchy <-
+            CoreResults %>%
+            distinct(DecompositionName) %>%
+            mutate(
+              DecompositionType_l1 = factor(
+                                      ifelse(DecompositionName == "Amount","Actual Results"
+                                             ,ifelse(str_sub(DecompositionName,1,7) == "Predict","Model Results"
+                                             ,ifelse(DecompositionName == "Residual","Residual","Other"))
+                                      )
+                                      ,levels = c("Actual Results","Model Results","Residual","Other"),ordered = T)
+              ,DecompositionType_l2 = sapply(DecompositionName,funApplyDecompositionHierarchy_l2)
+            )
+          
+          ## Dataframe output
+          CoreResults <-
+            CoreResults %>%
+            left_join(
+              tmpDecompositionHierarchy
+              ,by="DecompositionName"
+            )
+          
+          
+          ReportLevel4KeyList <- CoreResults %>% distinct(ReportLevel4Key) %>% pull()
+          
+          ## ReportLevel4Key level timeseries plots
+          ReportLevel4Key_ModelPlots <- lapply(
+            setNames(ReportLevel4KeyList,ReportLevel4KeyList),
+            function(x){
+              
+              CoreResults %>%
+                dplyr::filter(ReportLevel4Key == x) %>%
+                group_by(Date,ReportLevel4Key,DimAmountTypeKey,DecompositionType_l1) %>%
+                summarize(
+                  Amount = sum(Amount)
+                ) %>% ungroup() %>%
+                ggplot(aes(Date,Amount)) +
+                geom_bar(stat = "identity") +
+                facet_wrap(~DecompositionType_l1) +
+                labs(
+                  title = "Comparison of Actual, Model & Model Residual Results"
+                  ,subtitle = paste0("Volume of transactions sold for group ",x)
+                ) +
+                theme_classic() 
+            }
+          )
+          
+          ## ReportLevel4Key level residual histogram plots
+          ReportLevel4Key_ResidualPlots <- lapply(
+            setNames(ReportLevel4KeyList,ReportLevel4KeyList),
+            function(x){
+              
+              CoreResults %>%
+                dplyr::filter(ReportLevel4Key == x,DecompositionType_l1 == "Residual") %>%
+                group_by(Date,ReportLevel4Key,DimAmountTypeKey,DecompositionType_l1) %>%
+                summarize(
+                  Amount = sum(Amount)
+                ) %>% ungroup() %>%
+                ggplot(aes(Amount)) +
+                geom_histogram(bins = 20) +
+                labs(
+                  title = "ReportLevel4Key Aggregated Residual Distribution"
+                ) +
+                theme_classic() 
+            }
+          )
+          
+          ## Generate RMSE results per ReportLevel4Key and StayLengthName
+          
+          tmpAcc <- 
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 != "Model Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            mutate(
+              PercVar = Residual/`Actual Results`
+            ) %>% 
+            dplyr::filter(
+              is.finite(PercVar)
+              & !is.na(PercVar)
+            ) %>%
+            group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+            summarize(
+              MAEPerc = mean(abs(PercVar))
+              ,MBEPerc = mean(PercVar)
+              ,MAE = mean(abs(Residual))
+              ,MBE = mean(Residual)
+              ,Total = sum(`Actual Results`)
+            ) %>% ungroup() %>%
+            left_join(select(DimStayLength,StayLengthKey,StayLengthName),by="StayLengthKey") %>%
+            select(ReportLevel4Key,StayLengthName,DimAmountTypeKey,MAE,MBE,MAEPerc,MBEPerc,Total)
+          
+          AccFull <- 
+            CoreResults %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+            summarize(
+              RMSE = RMSE(`Actual Results`,`Model Results`)
+              ,ActualMean = mean(`Actual Results`)
+              ,RMSEPerc = RMSE/ActualMean
+            ) %>% ungroup() %>%
+            left_join(select(DimStayLength,StayLengthKey,StayLengthName),by="StayLengthKey") %>%
+            left_join(tmpAcc,by=c("ReportLevel4Key","StayLengthName","DimAmountTypeKey")) %>%
+            select(ReportLevel4Key,StayLengthName,DimAmountTypeKey,RMSE,ActualMean,RMSEPerc,MAEPerc,MBEPerc,MAE,MBE,Total) 
+          
+          rm(tmpAcc)
+          
+          ## Generate RMSE results per ReportLevel4Key
+          tmpAcc <-
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 != "Model Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            mutate(
+              PercVar = Residual/`Actual Results`
+            ) %>%
+            dplyr::filter(
+              is.finite(PercVar)
+              & !is.na(PercVar)
+            ) %>%
+            group_by(ReportLevel4Key,DimAmountTypeKey) %>%
+            summarize(
+              MAEPerc = mean(abs(PercVar))
+              ,MBEPerc = mean(PercVar)
+              ,MAE = mean(abs(Residual))
+              ,MBE = mean(Residual)
+              ,Total = sum(`Actual Results`)
+            ) %>% ungroup() %>%
+            select(ReportLevel4Key,DimAmountTypeKey,MAE,MBE,MAEPerc,MBEPerc,Total)
+          
+
+          AccReportLevel4Key <-
+            CoreResults %>%
+            group_by(Date,ReportLevel4Key,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            group_by(ReportLevel4Key,DimAmountTypeKey) %>%
+            summarize(
+              RMSE = RMSE(`Actual Results`,`Model Results`)
+              ,ActualMean = mean(`Actual Results`)
+              ,RMSEPerc = RMSE/ActualMean
+            ) %>% ungroup() %>%
+            left_join(tmpAcc,by=c("ReportLevel4Key","DimAmountTypeKey")) %>%
+            select(ReportLevel4Key,DimAmountTypeKey,RMSE,ActualMean,RMSEPerc,MAEPerc,MBEPerc,MAE,MBE,Total)
+          
+          rm(tmpAcc)
+          
+          ## Generate RMSE results high level
+          tmpAcc <- 
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 != "Model Results"
+            ) %>%
+            group_by(Date,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            mutate(
+              PercVar = Residual/`Actual Results`
+            ) %>% 
+            dplyr::filter(
+              is.finite(PercVar)
+              & !is.na(PercVar)
+            ) %>%
+            group_by(DimAmountTypeKey) %>%
+            summarize(
+              MAEPerc = mean(abs(PercVar))
+              ,MBEPerc = mean(PercVar)
+              ,MAE = mean(abs(Residual))
+              ,MBE = mean(Residual)
+              ,Total = sum(`Actual Results`)
+            ) %>% ungroup() %>%
+            select(DimAmountTypeKey,MAE,MBE,MAEPerc,MBEPerc,Total)
+          
+          AccHighLevel <-
+            CoreResults %>%
+            group_by(Date,DimAmountTypeKey,DecompositionType_l1) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            spread(DecompositionType_l1,Amount) %>%
+            group_by(DimAmountTypeKey) %>%
+            summarize(
+              RMSE = RMSE(`Actual Results`,`Model Results`)
+              ,ActualMean = mean(`Actual Results`)
+              ,RMSEPerc = RMSE/ActualMean
+            ) %>%
+            left_join(
+              tmpAcc,by="DimAmountTypeKey"
+            )
+          rm(tmpAcc)
+          
+          
+          ## Generate RMSE step change - full level
+          tmpActuals <- 
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Actual Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>%
+            summarize(
+              ActualResults = sum(Amount)
+            ) 
+          
+          RMSEStepChangeFull <-
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Model Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            group_by(Date,ReportLevel4Key,StayLengthKey,DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              Amount = rollapplyr(Amount, 99, sum, partial = T)
+            ) %>% 
+            left_join(tmpActuals,by=c("Date","ReportLevel4Key","StayLengthKey","DimAmountTypeKey")) %>%
+            group_by(ReportLevel4Key,StayLengthKey,DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              RMSE = RMSE(Amount,ActualResults)
+            ) %>% ungroup() %>%
+            left_join(select(DimStayLength,StayLengthKey,StayLengthName),by="StayLengthKey") %>%
+            group_by(ReportLevel4Key,StayLengthName,DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              RMSEChange = RMSE/lag(RMSE) - 1
+            ) %>% ungroup()
+          
+          rm(tmpActuals)
+          
+          ## Generate RMSE step change - ReportLevel4Key level
+          tmpActuals <- 
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Actual Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,DimAmountTypeKey) %>%
+            summarize(
+              ActualResults = sum(Amount)
+            ) 
+          
+          RMSEStepChange_ReportLevel4Key <-
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Model Results"
+            ) %>%
+            group_by(Date,ReportLevel4Key,DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            group_by(Date,ReportLevel4Key,DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              Amount = rollapplyr(Amount, 99, sum, partial = T)
+            ) %>% 
+            left_join(tmpActuals,by=c("Date","ReportLevel4Key","DimAmountTypeKey")) %>%
+            group_by(ReportLevel4Key,DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              RMSE = RMSE(Amount,ActualResults)
+            ) %>% ungroup() %>%
+            group_by(ReportLevel4Key,DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              RMSEChange = RMSE/lag(RMSE) - 1
+            ) %>% ungroup()
+          
+          rm(tmpActuals)
+          
+          ## Generate RMSE step change - High Level
+          tmpActuals <- 
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Actual Results"
+            ) %>%
+            group_by(Date,DimAmountTypeKey) %>%
+            summarize(
+              ActualResults = sum(Amount)
+            ) 
+          
+          RMSEStepChange_HighLevel <-
+            CoreResults %>%
+            dplyr::filter(
+              DecompositionType_l1 == "Model Results"
+            ) %>%
+            group_by(Date,DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              Amount = sum(Amount)
+            ) %>% ungroup() %>%
+            group_by(Date,DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              Amount = rollapplyr(Amount, 99, sum, partial = T)
+            ) %>% 
+            left_join(tmpActuals,by=c("Date","DimAmountTypeKey")) %>%
+            group_by(DimAmountTypeKey,DecompositionName) %>%
+            summarize(
+              RMSE = RMSE(Amount,ActualResults)
+            ) %>% ungroup() %>%
+            group_by(DimAmountTypeKey) %>% arrange(DecompositionName) %>%
+            mutate(
+              RMSEChange = RMSE/lag(RMSE) - 1
+            ) %>% ungroup()
+          
+          RMSEStepChange_HighLevel_Plot <-
+            RMSEStepChange_HighLevel %>%
+            dplyr::filter(DimAmountTypeKey == 103) %>%
+            ggplot(aes(DecompositionName,RMSE)) +
+            geom_bar(stat = "identity") +
+            labs(
+              title = "RMSE Improvement Per Decomposition (High Level)"
+            ) +
+            theme_classic() +
+            theme(
+              axis.text.x = element_text(angle = 90,hjust = 1)
+            )
+          
+          rm(tmpActuals)
+          rm(tmpDecompositionHierarchy)
+          
+          
+          OutputList <-
+            list(
+              CoreResults = CoreResults
+              ,Plots_TimeSeries = ReportLevel4Key_ModelPlots
+              ,Plots_Residual = ReportLevel4Key_ResidualPlots
+              ,AccFull = AccFull
+              ,AccReportLevel4Key = AccReportLevel4Key
+              ,AccHighLevel = AccHighLevel
+              ,RMSEStepChangeFull = RMSEStepChangeFull
+              ,RMSEStepChange_ReportLevel4Key = RMSEStepChange_ReportLevel4Key
+              ,RMSEStepChange_HighLevel = RMSEStepChange_HighLevel
+              ,RMSEStepChange_HighLevel_Plot = RMSEStepChange_HighLevel_Plot
+            )
+          
+          OutputList
+        }
+        
+## 40__Generate Training & Test Results ----
+        dfTest <- dfMain[testIndex,]
+        dfTrain <- dfMain[-testIndex,]
+        
+        dfTrain_Output <- applyTrainingResults(dfTrain,FactCampaignMajorClean)
+        dfTest_Output <- applyTrainingResults(dfTest,FactCampaignMajorClean)
+        
+        # dfTrain_Output$Plots_TimeSeries$`247`
+        # dfTest_Output$Plots_TimeSeries$`247`
+        # 
+        # dfTrain_Output$RMSEStepChange_HighLevel
+        # dfTrain_Output$RMSEStepChange_HighLevel_Plot
+        # dfTrain_Output$Plots_Residual$`247`
+        # dfTrain_Output$AccHighLevel
+        # 
+        # dfTest_Output$RMSEStepChange_HighLevel
+        # dfTest_Output$RMSEStepChange_HighLevel_Plot
+        # dfTest_Output$Plots_Residual$`247`
+        # dfTest_Output$AccHighLevel
+        
+        
+OverallAcc <-
+        bind_rows(
+          dfTest_Output$AccHighLevel %>% mutate(Data = "Test")
+          ,dfTrain_Output$AccHighLevel %>% mutate(Data = "Train")
+        ) %>%
+        select(
+          Data
+          ,MAE,MBE,RMSE
+          ,MAEPerc,MBEPerc,RMSEPerc
+        ) %>% knitr::kable()
+
+     
+OverallRMSEStepChange <-
+        dfTrain_Output$RMSEStepChange_HighLevel %>% rename(RMSE_Train = RMSE) %>% select(DecompositionName,RMSE_Train) %>%
+        left_join(
+          dfTest_Output$RMSEStepChange_HighLevel %>% rename(RMSE_Test = RMSE) %>% select(DecompositionName,RMSE_Test)
+          ,by="DecompositionName"
+        ) %>% knitr::kable()
+    
+
+```
+
+## Foreword
+
+The data used in this report and the underlying R code is based of sales data from a real car parking facility in Australia. As such many of the fields have been de-identified and only a sample has been extracted for this report.
+
+## Introduction
+
+To the general public, car parking is often an under looked piece of infrastructure that acts as the primary access point to many facilities. As technology has improved, many car parking businesses allow customers to book online in advance, benefiting both parties. The sales dynamics of online bookings are significantly different to the traditional drive-up experience as many other factors are introduced to the customers. Within this dynamic lies the complexity of long term trends and short term variations in car parking demand. The main goal of this report is to develop a machine learning algorithm that translates a lot of short term variation into business friendly factors. To achieve this the algorithm should be usable in a daily operational environment for performance attribution and also be scalable for future development.
+
+A customer’s choice of where to park and length of stay is driven by a commitment, or desire, to be somewhere. This can include commitments such as shopping, going on holiday or coming into work. Within these underlying commitments lies the different options available to a customer to get to their point of interest; not all modes of transport translate into the use of car parking. What often drives a customer to purchase a car parking product is the logistical convenience associated to their destination. What drives them away can be related to the price, especially against cheaper modes of travel such as ride share (Uber, Didi, Ola, etc) or public transportation (bus or train). 
+
+In general the customer demand for car parking products can be interpreted as a time series that can be broken down into:
+
+1. Long term: A persistent source of commitment.
+2. Short Term: Various time dependent factors.
+
+To achieve the main goal of this report, machine learning methods will be used to assist in decomposing the demand time series. While the focus will be on the short term variations, a long term approximation will be develop so that it can be decoupled from the time series. 
+
+## Data Sourcing, Cleanliness & Definitions
+
+The data has been provided in the form of an R.Data workspace, initially sourced from the corporate data warehouse. As mentioned in the foreword, key business fields have been de-identified and will generally be referred to by ID, unless they are sufficiently general by name. As the source data has undergone various ETL steps from the data warehouse, it is in a tidy format. Minimal transformations have been performed to make later calculations easier. 
+
+The sampled data is based on sales between 1 January 2017 and 30 May 2020. However the available data from Google Analytics only begins in late 2018. As such there is a calculation impact towards the training algorithm as the training must only be applied to the commonly available dates (will be discussed in "Methods - Key Steps").
+
+Below are terms that will be used throughout the report:
+
+* ReportLevel4Key - The ID relating to the car parking product.
+* StayLengthName - Denotes the length of time a customers has chosen to occupy a car parking space.
+* StayLengthKey - The ID relating to StayLengthName.
+* ATV - Short for "Average Transaction Value" which relates to the average price of a product for a particular occupancy time.
+* EDM - Short for "Electronic Direct Mail" is a form of digital marketing that uses email to target large groups of people.
+* GA - Short for "Google Analytics" which is a source of website performance data, such as number of sessions or users that a website achieves.
+* Centered Moving Average - Performs a moving average calculation with equal weightings to data points before and after the current point (often time series).
+
+
+## R Libraries
+The following R libraries have been used in the analysis.
+
+1. tidyverse - Forms the bread and butter of all data transformations.
+2. caret - Primary use is to partition the data for training and test validation.
+3. data.table - Used as an alternative to tidyverse for quicker and more efficient data transformations.
+4. ggplot2 - General plotting.
+5. zoo - Used alongside tidyverse and data.table to perform rolling/windowed calculations.
+6. broom - Used alongside tidyverse to output tidy results from regression analysis.
+7. lubridate - Used alongside tidyverse to parse out date components.
+
+Dplyr, as part of tidyverse, can fully replace data.table, but this will have a material impact in execution time.
+
+## R Code Overview
+
+The attached R code segments the code through outlines to make navigation easier. The progression of this report will follow closely to the R code.
+
+Due to the number of explanatory variables, the custom function "applyTrainingResults" has been used to accept data in the same format as the training or test validation sets. It also requires an EDM related data frame as a second input in order to calculate the impact of marketing activities. This function outputs a list of different objects with the main result data frame "CoreResults". It also generates a suite of accuracy plots and tables to show a summary of the different product breakdowns.
+
+## Methods - Key Steps
+
+Time series decomposition involves separating out the long term trend from the data in order to independently assess the seasonal and cyclical factors. As the focus of the report is to decompose the short term factors, an approximation for the long term trend will be sufficient. In saying that, the long term trend plays a pivotal role in calculating the short term factors, which will be covered in later sections.
+
+In the sample data provided, all the different combinations of ReportLevel4Key and StayLengthKey/StayLengthName act as different product groupings. 
+
+As mentioned in the "Data Sourcing, Cleanliness & Definitions" section the training must overcome the data availability difference between sales volume and Google Analytics. To do so, the training will prioritise on attributing factors that can use all of the sales volume data, then shrinking to accommodate for the marketing factors. This transition can be seen in the R code section "21 Calculate Non Seasonal Components". In general, time dependent seasonal factors will be trained on the full sales volume time series data. The data availability will be marked for each factor later in this report.
+
+The general overview of the methods are as follows (performed for each product combination):
+
+1. Approximate long term trend and remove it from the time series data.
+    + Refer to R code section "10 Calculate long term trends".
+2. Partition the data to training a test sets.
+    + Refer to R code section "12 Partition primary data frame".
+3. Calculate the impact of different seasonal and other non-seasonal short term factors.
+    + Refer to the relevant sections in the R code section "20 Calculate Seasonality components".
+4. Assess residuals and possibility of additional decomposition.
+    + Refer to the R code section "29 Remaining Residuals".
+5. Apply model to validation set for performance testing.
+    + Refer to the R code section "40 Generate Training & Test Results".
+
+Description of each factor explored in step 3 will be provided in the following sections.
+
+## Accuracy Measures
+
+This report uses the following metrics to measure accuracy. Ideally these metrics should be as close to zero as possible. The goal of each factor is to decrease the remaining residual.
+
+1. Root Mean Square Error (RMSE) - Calculates the average distance (scalar) of each sales volume prediction against what actually occured. Gives more weight to larger errors.
+2. Mean Absolute Error (MAE) - Similar to RMSE but takes the absolute value of the residual instead of squaring and square rooting. Even weighting between large and small errors.
+3. Mean Bias Error (MBE) - Similar to MAE but does not take the absolute value (vector quantity). If the resulting value is not 0 it suggested a model bias to under or over predict.
+
+To try and contextualise the accuracy measures above, the following relative percentage versions have also been calculated by dividing their non percentage counterparts by the actual results. Resulting NAs, Inf and -Inf results are omitted. This can bring out potential biases in the resulting values which will be covered in the model accuracy results section.
+
+4. RMSE Perc - specifically calculates the final RMSE of each group by the group's average.
+5. MAE Perc.
+6. MBE Perc. 
+
+## Decomposition & Analysis
+
+### Long Term Trend
+
+A common way to approximate a long term trend is to use a centered moving average that spans enough time points such that the variation from seasonal factors are sufficiently diluted. Sales related time series data would naturally have annual peaks and troughs as certain periods in the year perform better than others. An example would be heightened sales leading up to Christmas time. Applying this intuition to the sample data shows the relative over and under performance of some months when compared to a simple linear regression (to simulate a long term trend). 
+
+```{r monthly impact, echo = F, message = F, fig.align="center"}
+plot_initial_timeseries_monthly 
+```
+
+If annual seasonality is assumed to be the longest seasonal period in the time series, building a centered moving average that spans 364 days should produce a clear trend that is without any repeating local maxima or minima. The results of such a moving average can be seen below. It is quite clear that a 364 day span is sufficient to approximate a long term trend. The most notable dip in the data occurs during March 2020 when the COVID-19 virus made its initial impact in the industry.
+
+To account for the clear shift in trends between pre-COVID and post-COVID, two windows of the centered moving average was calculated. The first spanning before 22-Mar-2020 while the second comes afterwards. This was necessary as the drop in sales due to COVID-19 is an irregular external shock to the industry with which could not be reasonably forecasted.
+
+```{r long term trend, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_LongTermTrend 
+```
+
+### Short Term Trend - Partitioning
+
+Once the long term trend is stripped out, the remaining residuals form a "stationary" time series data, which meaans that the data is centrally distributed around zero. Below shows this result.
+
+```{r stationary residuals, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_StationaryTimeSeries
+```
+
+The remaining data is then partitioned to prepare for short term seasonality and factor decomposition. The end goal of the exercise is to perform attribution on a daily basis and update the training model with as much data as possible in order to capture recent market shifts. To simulate this, an 80/20 split was chosen. Higher proportions can be used but can easily lead to over training, while lower proportions may leave too much data out to perform meaningful decomposition.
+
+### Short Term Trend - Overview
+
+In every machine learning task, future use of training results must be considered. In the current context, scaling must be performed on the long term trend residuals so that the decomposed short term factors can be applied to whatever magnitude of sales data. If decomposition is done on raw residuals, it will only be relevant in the sales volume magnitude performed during the training and will adversely over or under estimate results if the underlying levels change. The best example of this is the transition to post-COVID sales volume where the overall average level of sales is significantly lower than pre-COVID but the same seasonal patterns remain. 
+
+To scale the data, the residuals of each decomposition step are divided by the long term trend. By doing so, the impact of each decomposition step is always relevant to the underlying level of sales volume in the current context.
+
+Each decomposition follows the general steps:
+
+1. Generate a plot to visualise the residual percentage impact.
+2. Calculate the grouped residual percentage impact and store in a separate data frame.
+3. Apply the sensitivities to the long term trend to approximate the relevant value (real not percentage) of the decomposed factor.
+4. Calculate new residuals after removing the impact as calculated in step 3.
+5. Generate a plot as per step 1 but using the new residuals generated in step 4. The percentage impact should be very close to zero. If not then further assessment must be done with the calculation.
+
+It is important to note that the magnitude of each factor's contribution is dependent on the order they are calculated but will always aggregate together to the same value. This is because the nature of the calculation is to average out the remaining residual after the prior calculation.
+
+Heuristically, it can be thought as removing water from a well with differently shaped buckets - each removes a different amount of water but will always add to the same aggregate volume.
+
+While the aggregate result remains the same, the differing impact of each factor would realistically affect decision making in a business environment. As such it is important to apply an order that resembles the business' understanding of how the factors relate to each other. In the context of the data, the decomposition generally starts from classically time dependent seasonality factors, to major marketing campaigns, and then to delayed effects of major marketing campaigns. More rigorous methods can be implemented in the future to average out the different impacts associated to different ordering.
+
+### Short Term Trend - Per Factor Decomposition
+
+The different factors are listed below, in the order they are calculated. A short description and its link to business context is provided alongside a visualisation to demonstrate the predictive power.
+
+For additional calculation detail, please refer to the submitted R code.
+
+#### 1 - Seasonal Month
+\hfill\break
+Uses all available training data.
+
+This factor represents the residual variability of each month of the year. Calculated by taking the average percentage remaining residual per month.
+
+Some months experience an increased number of bookings while the opposite is true. The primary example are the months leading up to December as customers are booking for longer term holidays. The opposite is true for January and June which follow Christmas and Easter holidays respectively.
+
+```{r pre seasonal month, fig.height = 3,echo = F, message = F, fig.align="center"}
+plot_PreMonth
+```
+
+#### 2 - Seasonal Day Of Week
+\hfill\break
+Uses all available training data.
+
+This factor represents the residual variability of each month of the year. Calculated by taking the average percentage remaining residual per day of week.
+This seasonality is heavily correlated with week day work schedules as there are many business related travel. As such Mondays to Thursdays experience much higher booking volumes whereas Friday and Saturday are the opposite.
+
+```{r pre seasonal DOW, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_PreDOW
+```
+
+#### 3 - Seasonal School Holiday
+\hfill\break
+Uses all available training data.
+
+This factor represents the residual variability of school holiday periods. The Australian school holiday periods are once per quarter on similar dates per year. Calculated by taking the average percentage remaining residual per school holiday. This factor represents the impact of school students being at home and the higher propensity for families to go on holiday.
+
+While the overall percentage residual per term is not as significant as the previous components, there is a clear difference between the first and last two terms.
+
+```{r pre seasonal school holiday, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_PreSchoolHoliday
+```
+
+#### 4 - Seasonal Influential Dates
+\hfill\break
+Uses all available training data.
+
+This factor represents the residual variability of different major holiday periods. This dimension is a mixture of single day holidays, such as ANZAC and Australia Day, and major holiday periods, such as the Christmas period. Similar to school holidays, this factor also represents the purchasing behaviour of customers on these major holiday periods.
+
+```{r pre seasonal influential date, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_PreInfluentialDate
+```
+
+#### 5 - EDM Major Average
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the average residual variability when EDMs are sent to customers.
+
+When an EDM is sent, there is generally a consistent uplift in sales volume. This seems to be due to the perceived value for the customer as the parking EDMs usually come with discount offers. 
+
+```{r pre EDM Major Avg, fig.height = 3, echo = F, message = F, warning = F, fig.align="center"}
+plot_PreEDMMajorAvg
+```
+
+#### 6 - EDM Major Month
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the monthly impact of the residual variability when EDMs are sent to customers. 
+
+The better performance of some months seems to line up with periods of high and low travel. For example, December performs the worst for EDMs, presumably because people have already booked well in advanced for the Christmas period. On the other hand the middle of the year performs the best, possibly due to heightened business travel and off-season holidays.
+
+```{r pre EDM Major Month, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_PreEDMMajorMonth
+```
+
+#### 7 - EDM Major Day Of Week
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the day of week impact of the residual variability when EDMs are sent to customers. 
+
+Similar to the general day of week component, this component seems to benefit Monday to Thursday bookings, seemingly correlated with business travel behaviour.
+
+```{r pre EDM Major DOW, fig.height = 3, echo = F, message = F, fig.align="center"}
+plot_PreEDMMajorDOW
+```
+
+#### 8 - EDM Major Lagged Average
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the delayed impact of the residual variability after EDMs are sent to customers. 
+
+While EDMs generally see significantly more bookings on the day they are sent out, a period of lower than trend performance is experienced for the following period. This is primarily due to the ability of EDMs to encourage people to book well ahead in time due to discount offers. The end impact results in shifting bookings ahead in time. What follows is usually a period of lower than trend sales volume as the market corrects itself. In general, EDMs result in a neutral sales volume position over a longer period.
+
+```{r pre EDM Major Lagged Average, echo = F,warning = F, message = F, fig.align="center"}
+plot_PreEDMMajorLaggedAvg
+```
+
+#### 9 - EDM Major Lagged Days
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the impact of the number of days since an EDM is sent. The model currently factors in up to a three day lag. Additional days can be modelled in but the relative impact becomes less significant and relevant.
+
+While the previous factor calculates an average level, this seeks to spread the delayed impact over the following days. For non limited time offer EDMs (those with a discount offer that lasts over 24 hours), the initial positive impact seems to carry forward for a few days after which it begins to show lower than trend performance. On the other hand, limited time offer EDMs seems to consistently see underperformance in the following days as the associated offer carries a time to purchase luxury.
+
+In the chart below, the first column represents non limited time offer EDMs while the second shows limited time offer EDMs. The x-axis represents the ID associated to each stay length. While the IDs are not strictly in order of occupancy time, it tries to represent the varying impact across different stay lengths.
+
+```{r pre EDM Major Lagged Days, fig.height = 6, echo = F, warning = F, message = F, fig.align="center"}
+plot_PreEDMMajorLaggedDays
+```
+
+#### 10 - EDM Major Lagged Days (DOW)
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This component further stratifies the previous factor by the day of week of each day after an EDM is sent out.
+
+```{r pre EDM Major Lagged Days DOW, fig.height = 6, echo = F, message = F, fig.align="center"}
+plot_PreEDMMajorLaggedDaysDOW
+```
+
+#### 11 - EDM Major Month Regression
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+This factor represents the impact of the EDM recipient volume on the residual variability, stratified by month.
+
+In general, it seems that the more recipients are targeted by an EDM, the better the impact on overall sales volume. With the clear exception of September, this behaviour holds true for most months. There seems to be some opportunity to further capitalise on high volume EDMs in July, August, November and December as these months have the steepest slope.
+
+```{r pre EDM Major Month Regression, echo = F, message = F, fig.align="center"}
+plot_PreEDMMajorMonthRgr
+```
+
+
+#### 12 - EDM Major Day Of Week Regression
+\hfill\break
+Uses Google Analytics and related sales data (post October 2018).
+
+Similar to the previous component, this factor represents the impact of recipient volume when stratified by the day of week. 
+
+The results are not nearly as significant as the monthly stratification but there is still some impact across the middle of the week.
+
+```{r pre EDM Major DOW Regression, echo = F, message = F, fig.align="center"}
+plot_PreEDMMajorDOWRgr
+```
+
+### Remaining Residuals - Sample Size
+After accounting for the long term trend approximation and numerous short term factors, the model is left with a relatively low level of residuals. A sample is shown below for ReportLevel4Key 247 and is faceted by day of week for clarity. 
+
+For demonstration purposes, the percentage error shown has a floor and ceiling of -1 and 1 respectively.
+
+```{r model resid 247, fig.height=8, echo = F, message = F, fig.align="center"}
+plotResidualPerc
+```
+
+An initial observation shows that the shorter half of the stay lengths have much lower percentage residuals. In fact, if the floor and ceiling restrictions were removed the longer stay lengths would show more severe gradient extremes, suggesting poor model performance. This is a result of lower volume data population. Commercialised car parks are normally designed to facilitate a continuous flow of customers going in and out. This is especially true for car parks within a business or retail hub where customers generally stay for shorter periods of time to fulfill work or purchasing commitments. Consequently, there would be significantly lower number of customers who choose to stay longer as there are not many associated commitments that require that length of stay. 
+
+This issue can be observed in the below table where the relative size of sales volume, MAE and MBE are calculated for the available dates.
+
+```{r model resid 247 size and accuracy, echo = F, message = F, fig.align="center"}
+kableResidualSample
+```
+
+In addition, the purchasing behaviour of longer stay customers are more sporadic. For example, it is reasonable to assume that customers go on a long holiday once per year which would require the purchase of longer occupancy. This effectively produces a burst in sales volume once a year while the rest of the period receives close to zero. The long term trend approximation assumes that bursts in sales are somewhat carried throughout the averaging window as it tries to smooth the peaks and troughs. In reality a more accurate approximation should partition the time series into periods of high sales and low sales volume. This would allow the short term factors to be calculated from a more realistic trend. As the overall sales volume in longer stay lengths are significantly lower, the general impact when assessing from a ReportLevel4Key perspective is quite low.
+
+### Remaining Residuals - Price
+\hfill\break
+While most of the short term variability has been modelled with time dependent and marketing related factors, it is also reasonable to factor in changes in product pricing. Such a relationship would generally fall under a demand and supply model where differing levels of price elasticity are introduced. The marketing related short term factors partially addresses price adjustments as most EDMs come with some discount level. However the component of the EDM that is independently associated with price elasticity is difficult to assess as its purpose is also to communicate and showcase the available products to customers. This can easily be seen in the regression components of the short term factors where EDM recipient volume seems to play a significant role in sales volume performance.
+
+To try and explore the impact of price on sales volume, correlations have been calculated for each stay length between model. These correlations are against:
+
+1. Percentage daily ATV (proxy for price) movements relative to prior day.
+  + Useful for assessing the impact of aggressive pricing strategies based on prior day prices.
+2. Percentage daily ATV movements relative to long term ATV trends.
+  + Useful for assessing the impact of price adjustments relative to what has been the trend.
+
+Below table shows a sample of the correlation results for ReportLevel4Key 247. Note that "Against Trend" refers to percentage ATV changes relative to its trend while "Against Prior Day" is a day on day percentage change. Unfortunately it is difficult to produce the correlation on an aggregated level as the price points and general sales volume for each product can vary significantly.
+
+```{r residual to price correlation, echo = F, message = F, fig.align="center"}
+CorATVAll
+```
+
+In general, the final model residuals show weak correlation, whether positive or negative, to price movements. There are some stay lengths that show better signs, such as 4 - 5 days, however these correlations are still low.
+
+To explore a different view, the model percentage residuals have also been regressed against the percentage daily price movements. The p.values for each stay length are shown in the below charts and shows a similar story to the correlations. Most stay lengths are well above a .05 significance level, making it difficult to justify using price as a reasonable explanatory variable to the remaining residual. However some stay lengths are statistically significant, such as the 4 - 5 day band. While there is potential to use price on statistically significant stay lengths, the relative explanatory power is quite low, as can be seen in the slopes generated below.
+
+A balance of explanatory power, in terms of regression coefficient, and achieving statistically significance are required to justify the use of ATV change to explain the remaining residuals.
+
+```{r,echo=F, echo = F, warning = F,fig.height=4, message = F,fig.show='hold',fig.align='center'}
+PlotLinearRegressionATVChangePercPrior
+```
+
+```{r,echo=FALSE, out.width='.49\\linewidth', fig.width=3, fig.height=10, echo = F, message = F,fig.show='hold',fig.align='center'}
+LinearRegressionATVChangePercPrior
+LinearRegressionATVChangePercTrend
+```
+
+### All Factors
+
+The model produces twelve different factors that influence the short term variability in online parking sales volume, plus the approximation for the long term trend. These can be categorised into logical groups as below.
+
+```{r , echo = F, message = F, fig.align="center"}
+dfTrain_Output$CoreResults %>% 
+  distinct(DecompositionType_l1,DecompositionType_l2,DecompositionName) %>%
+  dplyr::filter(
+    DecompositionType_l1 == "Model Results"
+  ) %>% knitr::kable()
+        
+```
+
+These groupings are designed to bridge the technical calculations and common business understanding. Prior to undertaking this analysis, the daily sales volume performance have been usually associated to seasonality and marketing related factors. As such the categorisation produced in this analysis naturally links with current business understanding and will help in future decision making.
+
+## Training Data Format
+
+Each short term factor sensitivity is stored in separate tables. The relevant grouping dimensions are also included so that they can be re-integrated back into the training, validation or a similarly formatted data frame.
+
+Below is a sample of what the training sensitivity data table looks like.
+
+```{r, echo = F, message = F, fig.align="center"}
+df_Pred_SeasonalMonth %>%
+  dplyr::filter(
+    ReportLevel4Key == 247
+    & StayLengthKey == 10
+    & DimAmountTypeKey == 103
+  ) %>% knitr::kable()
+```
+
+## Model Accuracy - Training & Test Sets
+
+### Training Accuracy
+
+Using the function "applyTrainingResults", the following summary accuracy measures have been produced for both training and test validation data. The relative performance of the model should be evaluated per ReportLevel4Key and StayLengthName as this is the common level of granularity for each short term factor. However there are too many groupings to cover in this report alone and a higher level summary will be used instead.
+
+```{r, echo = F, message = F, fig.align="center"}
+OverallAcc
+```
+
+It is also important to note the reason that the RMSE Perc result is lower than the MAE Perc, despite the opposite for the raw values, is because it is calculated by dividing the final RMSE by the group average sales volume. It washes out a lot of the finer variability that comes with the per day or per stay length granularity. Drilling down to stay length stratification brings the two percentage measures closer to each other. An example of this can be seen below where the error rate measures are shown per stay length of ReportLevel4Key 247 in the training data.
+
+```{r, echo = F, message = F, fig.align="center"}
+dfTrain_Output$AccFull %>%
+  dplyr::filter(
+    ReportLevel4Key == 247
+    & !StayLengthName %in% c("15 - 30 mins","30 - 60 mins","1 - 2 hours","2 - 3 hours","3 - 4 hours")
+  ) %>%
+  select(
+    StayLengthName
+    ,MAE,MBE,RMSE
+    ,MAEPerc,MBEPerc,RMSEPerc
+  ) %>% 
+  mutate(
+    MAE = round(MAE,2)
+    ,MBE = round(MBE,2)
+    ,RMSE = round(RMSE,2)
+    ,MAEPerc = round(MAEPerc,2)
+    ,MBEPerc = round(MBEPerc,2)
+    ,RMSEPerc = round(RMSEPerc,2)  
+  ) %>% knitr::kable()
+```
+
+Using MAEPerc and RMSEPerc as measures shows 17% and 12%, respectively, for the high level training data error rate. The MBE is close to zero which suggests that the model does not suffer from general under or over prediction. However the MBE Perc is not close to zero but can be explained by the omission of NA, Inf and -Inf results. Below visualisation shows the residuals for ReportLevel4Key 247 which is normally distributed around 0, supporting the low bias suggested from the MBE.
+
+```{r, echo = F, message = F, fig.align="center"}
+dfTrain_Output$Plots_Residual$`247`
+```
+
+As covered in the residual section, the relative error of the predictions increase as we get to longer stay lengths. This seems to be due to data population and long term trend calculation issues. As such it would be reasonable to say that the accuracy of this model is better suited for the shorter stay products where sales volume is more consistent throughout the year.
+
+While overall error is an important metric, it is also good to understand where most of the improvements comes from. This can be observed by plotting out the RMSE improvement per additional short term factor. The most significant improvements come from the SeasonalDOW, EDMMajorAvg and EDMMajorMonth factors while the remaining shows smaller contribution. As the predictive contribution of individual factors depend on the order they are calculated, it would be worthwhile to average out their contribution across different ordering. Nevertheless, the combined power of each factor significantly improves the predictive power from just using the long term trend as the data shows strong time dependent and marketing variability.
+
+```{r, echo = F, message = F, fig.align="center"}
+dfTrain_Output$RMSEStepChange_HighLevel_Plot
+```
+
+```{r, echo = F, message = F, fig.align="center"}
+dfTrain_Output$RMSEStepChange_HighLevel %>%
+  select(-DimAmountTypeKey) %>%
+  mutate(
+    RMSEChange = 100*round(RMSEChange,2)
+  ) %>%
+  rename(`% Change` = RMSEChange) %>%
+  knitr::kable()
+```
+
+### Test Validation Accuracy
+
+```{r, echo = F, message = F, fig.align="center"}
+OverallAcc
+```
+
+The raw MAE and RMSE values for the test set is significantly lower than the training set. However this does not tell the full story as there are other factors at play. To better gauge test set versus training set difference, it is better to look at the MAEPerc and RMSEPerc. They are both consistently higher than their traning dataset counterparts which is to be expected. MBE measure is also close to zero which suggests that the model is generally unbiased when applied to unseen data. While generally higher than the training set, the error rate metrics are still below 20% which is a good result considering this model is meant to be used on a daily basis.
+
+The significant difference between the raw MAE and RMSE values can be attributed to the data partitioning process and the granularity of the data. The partitioning was performed on a total dataset level while the training is performed on a product level. Consequently, the partition may unevenly distribute products with higher sales volume on some dates towards the training set on a per product level as the 80/20 split is performed on a higher level of granularity. This results in the partition samples becoming biased on a total sales volume perspective which directly impacts the MAE and RMSE results. The partitioning issue can be easily seen in the distribution plots below.
+
+```{r,echo=FALSE, message = F,fig.align='center'}
+dfTest_Output$CoreResults %>%
+  dplyr::filter(
+    ReportLevel4Key == 247
+    & StayLengthKey == 10
+    & DimAmountTypeKey == 103
+    & DecompositionType_l1 == "Actual Results"
+  ) %>%
+  ggplot(aes(Amount)) +
+  geom_histogram() +
+  labs(
+    title = "Sales Volume Distribution - Test Set"
+    ,subtitle = "Thinner distribution with less weighting on the higher volumes"
+  ) + 
+  theme_classic()
+
+dfTrain_Output$CoreResults %>%
+  dplyr::filter(
+    ReportLevel4Key == 247
+    & StayLengthKey == 10
+    & DimAmountTypeKey == 103
+    & DecompositionType_l1 == "Actual Results"
+  ) %>%
+  ggplot(aes(Amount)) +
+  geom_histogram() +
+  labs(
+    title = "Sales Volume Distribution - Training Set"
+    ,subtitle = "More pronounced normal distribution with heavier weighting in the middle"
+  ) + 
+  theme_classic()
+```
+
+To avoid this issue, the partitioning should be done on a per product level to match the training algorithm.
+
+### Overtraining
+
+As covered earlier, the marketing related factors suffer from a smaller volume of data due to a shorter date range. Consequently, the different levels of groupings in the EDM factors can lead to over training as the sample size can be quite small. While this is a real issue, the impact on the accuracy measures when moving from training to test data sets is not significant enough to suggest over training. The operational use of this model lends itself to be retrained periodically with larger datasets. This will naturally get to a point where the group sizes per factor will get large enough such that the data vailability issue will become negligible.
+
+## Challenges & Potential Improvements
+
+While the report demonstrates a clear outline to decomposing the short term variability, there have been plenty of challenges and room for improvement.
+
+* Data partitioning
+  + Refer to "Test Validation Accuracy" section for more details.
+  + Grouped K Folds within "createDataPartition" should be used in future.
+* Error rate
+  + While the sub 20% error rate is reasonable there is potential for further improvement by trying to factor in price adjustments (differently to what was explored earlier) and website performance as reported in Google Analytics.
+  + Applying algorithms within the caret suite to further reduce the error rate.
+    - The main caveat of using other algorithms is their ability to translate to common business understanding.
+* Long Term Trend
+  + While the focus is on short term analysis, the long term trend still plays an important role as it allows the factors to be calculated on a relative level.
+  + More sophisticated methods than centered moving average should be used as it has difficulty handling seasonal bursts of sales activity (covered in " Remaining Residuals - Sample Size").
+* Matching data availability
+  + The only way to fix this is to somehow backdate Google Analytics data to match the date range of the sales volume.
+* Sampling and over training
+  + Refer to the previous section "Overtraining".
+* Decomposition order
+  + As explored in "Short Term Trend - Overview", the order of decomposition influences the individual impact of each factor. Averaging out the resulting impact from all ordering combinations may result in a balanced view of each factor.
+
+As mentioned previously, the intent behind this report is for operational business use. In doing so, constant improvements, iterations and more data will generally alleviate a lot of the issues listed above.
+  
+## Summary
+
+In summary the model has set successfully decomposed a large proportion of the daily variation experienced within the online parking sales data. The factors produced from the model are easily translatable to common business understanding which easily allows the model to be built up. The model itself is also quite dynamic and easily allows for new factors to be plugged in. In addition, the model also provides a framework to build quantitative factors that easily support future business decisions. As outlined in the previous section, there many avenues for improvement which will be actively explored in the coming months to further increase the accuracy of the model.
